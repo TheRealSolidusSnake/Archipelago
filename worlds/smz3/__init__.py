@@ -500,11 +500,11 @@ class SMZ3World(World):
             multidata["connect_names"][new_name] = payload
 
     def fill_slot_data(self):
-        slot_data = {option_name: getattr(self.options, option_name).value for option_name in slot_options}
-
         slot_options = ["goal", "open_tower", "ganon_vulnerable",
                             "open_tourian", "sm_logic", "key_shuffle",
         ]
+        slot_data = {option_name: getattr(self.options, option_name).value for option_name in slot_options}
+
         return slot_data
 
     def collect(self, state: CollectionState, item: Item) -> bool:
