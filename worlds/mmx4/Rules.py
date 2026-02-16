@@ -98,6 +98,10 @@ def set_rules(world: "MMX4World"):
 
     # Sigma Access
     # Final Weapon Life Energy (3) requires Rising Fire
+    add_rule(
+        world.multiworld.get_entrance("Stage Select -> Space Port", player),
+        lambda state: stage_access_count(state, player) >= 8
+    )
     if did_include_pickup_locations(world):
         add_rule(world.multiworld.get_location("Final Weapon Life Energy (3)", player),
                  lambda state: state.has("Rising Fire", player))
