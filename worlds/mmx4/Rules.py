@@ -59,14 +59,6 @@ def set_rules(world: "MMX4World"):
                  lambda state: state.has("Soul Body", player))
         add_rule(world.multiworld.get_location("Cyber Peacock Sub Tank", player),
                  lambda state: state.has("Soul Body", player))
-        add_rule(world.multiworld.get_location("Helmet Upgrade", player),
-                 lambda state: state.has("Soul Body", player))
-
-        # Storm Owl
-        add_rule(world.multiworld.get_location("Arms Upgrade 1", player),
-                 lambda state: state.has("Lightning Web", player))
-        add_rule(world.multiworld.get_location("Arms Upgrade 2", player),
-                 lambda state: state.has("Lightning Web", player))
 
         # Magma Dragoon
         add_rule(world.multiworld.get_location("Body Upgrade", player),
@@ -90,18 +82,32 @@ def set_rules(world: "MMX4World"):
     add_rule(world.multiworld.get_location("Frost Walrus Heart Tank", player),
              lambda state: state.has("Rising Fire", player))
     add_rule(world.multiworld.get_location("Frost Walrus Extra Lives Tank", player),
-             lambda state: state.has("Lightning Web", player))
+         (lambda state: state.has("Soul Body", player)) if is_zero(world)
+         else (lambda state: state.has("Lightning Web", player)))
+
+    # Storm Owl
+    add_rule(world.multiworld.get_location("Arms Upgrade 1", player),
+             (lambda state: state.has("Soul Body", player)) if is_zero(world)
+             else (lambda state: state.has("Lightning Web", player)))
+    add_rule(world.multiworld.get_location("Arms Upgrade 2", player),
+             (lambda state: state.has("Soul Body", player)) if is_zero(world)
+             else (lambda state: state.has("Lightning Web", player)))
+
+    # Cyber Peacock
+    add_rule(world.multiworld.get_location("Helmet Upgrade", player),
+             lambda state: state.has("Soul Body", player))
 
     # Colonel Access
-    add_rule(world.multiworld.get_location("Memorial Hall Colonel Defeated", player),
-             lambda state: stage_access_count(state, player) >= 4)
+    colonel_rule = ((lambda state: stage_access_count(state, player) >= 8) if is_zero(world)
+               else (lambda state: stage_access_count(state, player) >= 4))
+
+    add_rule(world.multiworld.get_location("Memorial Hall Colonel Defeated", player), colonel_rule)
+    add_rule(world.multiworld.get_location("Space Port Colonel Defeated", player), colonel_rule)
 
     # Sigma Access
     # Final Weapon Life Energy (3) requires Rising Fire
-    add_rule(
-        world.multiworld.get_entrance("Stage Select -> Space Port", player),
-        lambda state: stage_access_count(state, player) >= 8
-    )
+    add_rule(world.multiworld.get_entrance("Stage Select -> Space Port", player),
+             lambda state: stage_access_count(state, player) >= 8)
     if did_include_pickup_locations(world):
         add_rule(world.multiworld.get_location("Final Weapon Life Energy (3)", player),
                  lambda state: state.has("Rising Fire", player))

@@ -7,13 +7,10 @@ if TYPE_CHECKING:
     from . import MMX4World
 
 ZERO_EXCLUDED_LOCATIONS = {
-    "Legs Upgrade",
     "Cyber Peacock Heart Tank",
     "Cyber Peacock Sub Tank",
-    "Helmet Upgrade",
-    "Arms Upgrade 1",
-    "Arms Upgrade 2",
     "Body Upgrade",
+    "Memorial Hall Colonel Defeated",
 }
 
 def did_include_pickup_locations(world: "MMX4World") -> bool:
@@ -35,13 +32,13 @@ def get_location_names() -> Dict[str, int]:
     return names
 
 def is_valid_location(world: "MMX4World", name) -> bool:
+    # Pickupsanity filter
     if not did_include_pickup_locations(world) and name in pickup_locations:
         return False
 
-    character_value = getattr(world.options.character, "value", world.options.character)
+    char_opt = getattr(world.options.character, "value", world.options.character)
 
-    if character_value == world.options.character.option_zero \
-            and name in ZERO_EXCLUDED_LOCATIONS:
+    if char_opt == world.options.character.option_zero and name in ZERO_EXCLUDED_LOCATIONS:
         return False
 
     return True
