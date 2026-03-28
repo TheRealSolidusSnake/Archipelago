@@ -1,7 +1,7 @@
-from typing import List, Dict, Any
+from typing import Mapping, Iterator, List, Dict, Any
 from dataclasses import dataclass
 from worlds.AutoWorld import PerGameCommonOptions
-from Options import Choice, OptionGroup, Toggle, Range, StartInventoryPool
+from Options import Choice, OptionGroup, Toggle, Range, StartInventoryPool, ItemDict
 
 def create_option_groups() -> List[OptionGroup]:
     option_group_list: List[OptionGroup] = []
@@ -26,6 +26,189 @@ class PickupSanity(Toggle):
     """
     display_name = "Pickupsanity"
 
+class EnableBossItemRequirements(Toggle):
+    """
+    Whether to enable item requirements for bosses
+    """
+    display_name = "Enable Boss Item Requirements"
+
+
+class WebSpiderRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Web Spider
+    for example: { Twin Slasher: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Web Spider Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class CyberPeacockRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Cyber Peacock
+    for example: { Soul Body: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Cyber Peacock Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class StormOwlRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Storm Owl
+    for example: { Aiming Laser: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Storm Owl Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class MagmaDragoonRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Magma Dragoon
+    for example: { Double Cyclone: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Magma Dragoon Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class JetStingrayRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Jet Stingray
+    for example: { Frost Tower: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Jet Stingray Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class SplitMushroomRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Split Mushroom
+    for example: { Lightning Web: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Split Mushroom Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class SlashBeastRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Slash Beast
+    for example: { Ground Hunter: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Slash Beast Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
+class FrostWalrusRequirement(ItemDict, Mapping[str, int]):
+    """
+    A list of items required in logic to beat Frost Walrus
+    for example: { Rising Fire: 1, Heart Tank: 2 }
+    """
+
+    display_name = "Frost Walrus Requirement"
+    value: Dict[str, int]
+
+    @property
+    def count(self) -> int:
+        return sum(self.values())
+
+    def __getitem__(self, key: str) -> int:
+        return self.value.__getitem__(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return self.value.__iter__()
+
+    def __len__(self) -> int:
+        return self.value.__len__()
+
 # making this mixin so we can keep actual game options separate from AP core options that we want enabled
 # not sure why this isn't a mixin in core atm, anyways
 @dataclass
@@ -36,6 +219,16 @@ class StartInventoryFromPoolMixin:
 class MMX4Options(StartInventoryFromPoolMixin, PerGameCommonOptions):
     pickupsanity: PickupSanity
     character: Character
+
+    enable_boss_item_requirements: EnableBossItemRequirements
+    web_spider_requirement: WebSpiderRequirement
+    cyber_peacock_requirement: CyberPeacockRequirement
+    storm_owl_requirement: StormOwlRequirement
+    magma_dragoon_requirement: MagmaDragoonRequirement
+    jet_stingray_requirement: JetStingrayRequirement
+    split_mushroom_requirement: SplitMushroomRequirement
+    slash_beast_requirement: SlashBeastRequirement
+    frost_walrus_requirement: FrostWalrusRequirement
 
 option_groups: Dict[str, List[Any]] = {
     "General Options": [PickupSanity],
