@@ -42,7 +42,9 @@ class MMX4World(World):
     def __init__(self, multiworld: "MultiWorld", player: int):
         super().__init__(multiworld, player)
 
-    #def generate_early(self):
+    def generate_early(self):
+        if getattr(self.options.character, "value", self.options.character) == self.options.character.option_zero:
+            self.options.local_items.value.add("Soul Body")
 
     def create_regions(self):
         create_regions(self)

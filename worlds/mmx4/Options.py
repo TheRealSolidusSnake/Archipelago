@@ -1,7 +1,7 @@
 from typing import List, Dict, Any
 from dataclasses import dataclass
 from worlds.AutoWorld import PerGameCommonOptions
-from Options import Choice, OptionGroup, Toggle, Range
+from Options import Choice, OptionGroup, Toggle, Range, StartInventoryPool
 
 def create_option_groups() -> List[OptionGroup]:
     option_group_list: List[OptionGroup] = []
@@ -26,8 +26,14 @@ class PickupSanity(Toggle):
     """
     display_name = "Pickupsanity"
 
+# making this mixin so we can keep actual game options separate from AP core options that we want enabled
+# not sure why this isn't a mixin in core atm, anyways
 @dataclass
-class MMX4Options(PerGameCommonOptions):
+class StartInventoryFromPoolMixin:
+    start_inventory_from_pool: StartInventoryPool
+
+@dataclass
+class MMX4Options(StartInventoryFromPoolMixin, PerGameCommonOptions):
     pickupsanity: PickupSanity
     character: Character
 

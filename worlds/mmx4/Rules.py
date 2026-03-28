@@ -1,5 +1,5 @@
 from BaseClasses import CollectionState
-from worlds.generic.Rules import add_rule
+from worlds.generic.Rules import add_rule, forbid_item
 from typing import TYPE_CHECKING
 from .Locations import did_include_pickup_locations
 
@@ -66,6 +66,16 @@ def set_rules(world: "MMX4World"):
                  and state.has("Twin Slasher", player)
                  and (state.has("Plasma Shot Upgrade", player) or state.has("Stock Charge Upgrade", player)))
 
+    elif did_include_pickup_locations(world):
+        # Zero cannot damage the Intro boss if Soul Body is acquired early
+        # so we limit Soul Body to local only and restrict from being on the Intro Stage pickups :/ Thanks Capcom
+        for location_name in (
+            "Intro Stage Life Energy (1)",
+            "Intro Stage Max Life Energy (1)",
+            "Intro Stage 1 Up (1)",
+        ):
+            forbid_item(world.multiworld.get_location(location_name, player), "Soul Body", player)
+
     # Web Spider Locations
     add_rule(world.multiworld.get_location("Web Spider Heart Tank", player),
              lambda state: state.has("Rising Fire", player))
@@ -98,10 +108,12 @@ def set_rules(world: "MMX4World"):
              lambda state: state.has("Soul Body", player))
 
     # Colonel Access
-    colonel_rule = ((lambda state: stage_access_count(state, player) >= 8) if is_zero(world)
-               else (lambda state: stage_access_count(state, player) >= 4))
+    colonel_rule = (lambda state: stage_access_count(state, player) >= 8) if is_zero(world) \
+                    else (lambda state: stage_access_count(state, player) >= 4)
 
-    add_rule(world.multiworld.get_location("Memorial Hall Colonel Defeated", player), colonel_rule)
+    if not is_zero(world):  # because Zero excludes Memorial Hall entirely
+        add_rule(world.multiworld.get_location("Memorial Hall Colonel Defeated", player), colonel_rule)
+
     add_rule(world.multiworld.get_location("Space Port Colonel Defeated", player), colonel_rule)
 
     # Sigma Access
