@@ -1,33 +1,84 @@
+import typing
 from BaseClasses import CollectionState
 from worlds.generic.Rules import add_rule, forbid_item
 from typing import TYPE_CHECKING
+
+from .Options import MMX4Options
 from .Locations import did_include_pickup_locations
 
 if TYPE_CHECKING:
     from . import MMX4World
 
-def stage_access_count(state: CollectionState, player: int) -> int:
+def stage_access_count(state: CollectionState, options: MMX4Options, player: int) -> int:
     count = 0;
-    if state.has("Web Spider Stage Access", player):
+    if can_beat_web_spider(state, options, player):
         count = count + 1
-    if state.has("Cyber Peacock Stage Access", player):
-        count = count + 1    
-    if state.has("Storm Owl Stage Access", player):
+    if can_beat_cyber_peacock(state, options, player):
         count = count + 1
-    if state.has("Magma Dragoon Stage Access", player):
+    if can_beat_strom_owl(state, options, player):
         count = count + 1
-    if state.has("Jet Stingray Stage Access", player):
+    if can_beat_magma_dragoon(state, options, player):
         count = count + 1
-    if state.has("Split Mushroom Stage Access", player):
+    if can_beat_jet_stingray(state, options, player):
         count = count + 1
-    if state.has("Slash Beast Stage Access", player):
+    if can_beat_split_mushroom(state, options, player):
         count = count + 1
-    if state.has("Frost Walrus Stage Access", player):
+    if can_beat_slash_beast(state, options, player):
+        count = count + 1
+    if can_beat_frost_walrus(state, options, player):
         count = count + 1
     return count
 
 def is_zero(world: "MMX4World") -> bool:
     return getattr(world.options.character, "value", world.options.character) == 1
+
+def can_beat_web_spider(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Web Spider Stage Access", player) and state.has_all_counts(options.web_spider_requirement, player);
+    else:
+        return state.has("Web Spider Stage Access", player)
+
+def can_beat_cyber_peacock(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Cyber Peacock Stage Access", player) and state.has_all_counts(options.cyber_peacock_requirement, player);
+    else:
+        return state.has("Cyber Peacock Stage Access", player)
+
+def can_beat_strom_owl(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Storm Owl Stage Access", player) and state.has_all_counts(options.storm_owl_requirement, player);
+    else:
+        return state.has("Storm Owl Stage Access", player)
+
+def can_beat_magma_dragoon(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Magma Dragoon Stage Access", player) and state.has_all_counts(options.magma_dragoon_requirement, player);
+    else:
+        return state.has("Magma Dragoon Stage Access", player)
+
+def can_beat_jet_stingray(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Jet Stingray Stage Access", player) and state.has_all_counts(options.jet_stingray_requirement, player);
+    else:
+        return state.has("Jet Stingray Stage Access", player)
+
+def can_beat_split_mushroom(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Split Mushroom Stage Access", player) and state.has_all_counts(options.split_mushroom_requirement, player);
+    else:
+        return state.has("Split Mushroom Stage Access", player)
+
+def can_beat_slash_beast(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Slash Beast Stage Access", player) and state.has_all_counts(options.slash_beast_requirement, player);
+    else:
+        return state.has("Slash Beast Stage Access", player)
+
+def can_beat_frost_walrus(state: CollectionState, options: MMX4Options, player: int) -> bool:
+    if(bool(options.enable_boss_item_requirements)):
+        return state.has("Frost Walrus Stage Access", player) and state.has_all_counts(options.frost_walrus_requirement, player);
+    else:
+        return state.has("Frost Walrus Stage Access", player)
 
 def set_rules(world: "MMX4World"):
     player = world.player
@@ -50,6 +101,41 @@ def set_rules(world: "MMX4World"):
              lambda state: state.has("Slash Beast Stage Access", player))
     add_rule(world.multiworld.get_entrance("Stage Select -> Frost Walrus", player),
              lambda state: state.has("Frost Walrus Stage Access", player))
+
+    # Boss Requirements
+    if(bool(options.enable_boss_item_requirements)):
+        add_rule(world.multiworld.get_location("Web Spider Defeated", player),
+                 lambda state: can_beat_web_spider(state, options, player))
+        add_rule(world.multiworld.get_location("Cyber Peacock Defeated", player),
+                 lambda state: can_beat_cyber_peacock(state, options, player))
+        add_rule(world.multiworld.get_location("Storm Owl Defeated", player),
+                 lambda state: can_beat_strom_owl(state, options, player))
+        add_rule(world.multiworld.get_location("Magma Dragoon Defeated", player),
+                 lambda state: can_beat_magma_dragoon(state, options, player))
+        add_rule(world.multiworld.get_location("Jet Stingray Defeated", player),
+                 lambda state: can_beat_jet_stingray(state, options, player))
+        add_rule(world.multiworld.get_location("Split Mushroom Defeated", player),
+                 lambda state: can_beat_split_mushroom(state, options, player))
+        add_rule(world.multiworld.get_location("Slash Beast Defeated", player),
+                 lambda state: can_beat_slash_beast(state, options, player))
+        add_rule(world.multiworld.get_location("Frost Walrus Defeated", player),
+                 lambda state: can_beat_frost_walrus(state, options, player))
+        add_rule(world.multiworld.get_location("Web Spider Weapon", player),
+                 lambda state: can_beat_web_spider(state, options, player))
+        add_rule(world.multiworld.get_location("Cyber Peacock Weapon", player),
+                 lambda state: can_beat_cyber_peacock(state, options, player))
+        add_rule(world.multiworld.get_location("Storm Owl Weapon", player),
+                 lambda state: can_beat_strom_owl(state, options, player))
+        add_rule(world.multiworld.get_location("Magma Dragoon Weapon", player),
+                 lambda state: can_beat_magma_dragoon(state, options, player))
+        add_rule(world.multiworld.get_location("Jet Stingray Weapon", player),
+                 lambda state: can_beat_jet_stingray(state, options, player))
+        add_rule(world.multiworld.get_location("Split Mushroom Weapon", player),
+                 lambda state: can_beat_split_mushroom(state, options, player))
+        add_rule(world.multiworld.get_location("Slash Beast Weapon", player),
+                 lambda state: can_beat_slash_beast(state, options, player))
+        add_rule(world.multiworld.get_location("Frost Walrus Weapon", player),
+                 lambda state: can_beat_frost_walrus(state, options, player))
 
     # Zero Specific Locations that shouldn't exist if chosen as the character to play as, otherwise they get added to the pool
     if not is_zero(world):
@@ -108,8 +194,8 @@ def set_rules(world: "MMX4World"):
              lambda state: state.has("Soul Body", player))
 
     # Colonel Access
-    colonel_rule = (lambda state: stage_access_count(state, player) >= 8) if is_zero(world) \
-                    else (lambda state: stage_access_count(state, player) >= 4)
+    colonel_rule = (lambda state: stage_access_count(state, options, player) >= 8) if is_zero(world) \
+                    else (lambda state: stage_access_count(state, options, player) >= 4)
 
     if not is_zero(world):  # because Zero excludes Memorial Hall entirely
         add_rule(world.multiworld.get_location("Memorial Hall Colonel Defeated", player), colonel_rule)
@@ -119,7 +205,7 @@ def set_rules(world: "MMX4World"):
     # Sigma Access
     # Final Weapon Life Energy (3) requires Rising Fire
     add_rule(world.multiworld.get_entrance("Stage Select -> Space Port", player),
-             lambda state: stage_access_count(state, player) >= 8)
+             lambda state: stage_access_count(state, options, player) >= 8)
     if did_include_pickup_locations(world):
         add_rule(world.multiworld.get_location("Final Weapon Life Energy (3)", player),
                  lambda state: state.has("Rising Fire", player))
