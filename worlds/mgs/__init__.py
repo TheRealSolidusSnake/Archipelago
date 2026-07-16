@@ -87,6 +87,29 @@ class MGSWorld(World):
     
     def set_rules(self) -> None:
         Rules.set_rules(self)
+
+    def fill_hook(
+        self,
+        progitempool: typing.List[Items.MGSItems],
+        usefulitempool: typing.List[Items.MGSItems],
+        filleritempool: typing.List[Items.MGSItems],
+        fill_locations: list,
+    ) -> None:
+        # Required Dogtags are progression for the completion condition, but they
+        # do not unlock any locations. Move them out of restrictive progression
+        # fill and place them with useful items instead. Their classification is
+        # left unchanged.
+        required_dogtags = [
+            item for item in progitempool
+            if item.player == self.player and item.name == 'Dogtag'
+        ]
+
+        progitempool[:] = [
+            item for item in progitempool
+            if not (item.player == self.player and item.name == 'Dogtag')
+        ]
+
+        usefulitempool.extend(required_dogtags)
     
     def create_items(self) -> None:
         # Start off by creating all the items that absolutely need to be in the run
@@ -130,8 +153,7 @@ class MGSWorld(World):
             filler_count = len(self.multiworld.get_unfilled_locations(self.player)) - len(self.item_pool) - 15 - 2 # Two events need to be subtracted as well!
         else:
             filler_count = len(self.multiworld.get_unfilled_locations(self.player)) - len(self.item_pool) - 1 - 2
-        # Fill the item pool with additional items, weighted towards SOCOM, Stun Grenades, and Rations, then FAMAS, Stinger, PSG-1, and Chaff Grenades etc.
-        # FAMAS used to be with SOCOM/Rations, but you fill up on ammo too fast which causes you to not be able to pick up items and there is very little reason to be shooting in this game to begin with.
+        # Fill the item pool with additional items, weighted towards SOCOM, FA-MAS, and Rations, then Stinger, PSG-1, and Chaff Grenades, then everything else.
         for _ in range(filler_count):
             match self.random.randint(0, 2):
                 case 0 | 1:
@@ -139,7 +161,7 @@ class MGSWorld(World):
                         case 0:
                             self.item_pool.append(self.create_item_useful('SOCOM'))
                         case 1:
-                            self.item_pool.append(self.create_item_filler('Stun Grenade'))
+                            self.item_pool.append(self.create_item_useful('FA-MAS'))
                         case 2:
                             self.item_pool.append(self.create_item_useful('Ration'))
                 case 2:
@@ -151,7 +173,7 @@ class MGSWorld(World):
                         case 4 | 5:
                             self.item_pool.append(self.create_item_useful('Chaff Grenade'))
                         case 6:
-                            self.item_pool.append(self.create_item_useful('FA-MAS'))
+                            self.item_pool.append(self.create_item_filler('Stun Grenade'))
                         case 7:
                             self.item_pool.append(self.create_item_filler('Diazepam'))
                         case 8:

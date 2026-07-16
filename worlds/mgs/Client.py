@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from pathlib import Path
 
 from NetUtils import ClientStatus, NetworkItem
+from Utils import user_path
 
 import worlds._bizhawk as bizhawk
 from worlds._bizhawk.client import BizHawkClient
@@ -14,6 +15,7 @@ from .RAMAddress import RAM
 from . import Locations
 from . import Items
 from . import Options
+from . import Regions
 
 if TYPE_CHECKING:
     from worlds._bizhawk.context import BizHawkClientContext, BizHawkClientCommandProcessor
@@ -24,6 +26,14 @@ if TYPE_CHECKING:
 # TODO MGS: Refactor different sections of game_watcher to their own functions
 
 logger = logging.getLogger('Client')
+
+
+def to_u16_bytes(value: int) -> bytes:
+    # PSX inventory/ammo fields are unsigned 16-bit. Values can legitimately
+    # reach 0xFFFF in saves; AP rewards after that must not overflow
+	# or else the client will refuse to send/receive anymore
+    value = max(0, min(int(value), 0xFFFF))
+    return value.to_bytes(length=2, byteorder='little')
 
 def cmd_check_goal(self: "BizHawkClientCommandProcessor") -> None:
     """Check progress towards goal"""
@@ -38,10 +48,10 @@ def cmd_check_goal(self: "BizHawkClientCommandProcessor") -> None:
                 logger.info('Run Goal: Game Completion')
             case 1:
                 logger.info('Run Goal: Boss Blitz')
-                logger.info(f'Defeated {client.save_state['dogtag_counter']} of {client.boss_goal} bosses.')
+                logger.info(f"Defeated {client.save_state['dogtag_counter']} of {client.boss_goal} bosses.")
             case 2:
                 logger.info('Run Goal: Dogtag Collection')
-                logger.info(f'Collected {client.save_state['dogtag_counter']} of {client.dogtag_goal} dogtags.')
+                logger.info(f"Collected {client.save_state['dogtag_counter']} of {client.dogtag_goal} dogtags.")
             case _:
                 logger.info(f'[Metal Gear Solid] Error checking goal: {client.run_goal}')
     else:
@@ -74,7 +84,7 @@ def cmd_check_collection(self: "BizHawkClientCommandProcessor", region='here') -
     else:
         logger.info('Region name not recognized.')
     logger.info('=====================================')
-    logger.info('NOTE: Some locations are missable. Ex. The Mine Detector location won\'t spawn if you\'ve recieved the Mine Detector as an item. Progression items will never be found at these locations.')
+    logger.info('NOTE: Locations labeled missable can now contain progression. Matching items are held until the physical pickup is checked.')
 
 def cmd_kill_mantis(self: "BizHawkClientCommandProcessor") -> None:
     """Kill Psycho Mantis in case you cannot change controller ports. Do not use during 'HIDEO'! Needs to be used at each phase of his fight. Need to last hit when Mantis is at 0 HP"""
@@ -85,10 +95,39 @@ def cmd_kill_mantis(self: "BizHawkClientCommandProcessor") -> None:
     assert isinstance(client, MetalGearSolidClient)
     client.kill_mantis_command = True
 
+# Single source of truth for "which Key Card level does this cutscene text belong to".
+# Gray Fox happened to want to send Key Card 5 from Nuke Building B1 for some reason. (since we added regions, anyway)
+# So we try to lock the key cards to their appropriate locations.
+KEY_CARD_LEVEL_BY_CUTSCENE_BYTES: dict[bytes, int] = {
+    RAM.key_card_level_1_cutscene_bytes: 1,
+    RAM.key_card_level_2_cutscene_bytes: 2,
+    RAM.key_card_level_3_cutscene_bytes: 3,
+    RAM.key_card_level_4_cutscene_bytes: 4,  # shared with 'BOSS: Gray Fox'
+    RAM.key_card_level_5_cutscene_bytes: 5,
+    RAM.key_card_level_6_cutscene_bytes: 6,  # shared with 'Otacon Gifts'
+    RAM.key_card_level_7_cutscene_bytes: 7,  # shared with 'BOSS: Vulcan Raven'
+}
+
 class MetalGearSolidClient(BizHawkClient):
     game = "Metal Gear Solid"
     system = "PSX"
     patch_suffix = ".apmgs"
+
+    # These are physical pickups that disappear if the player already has the item.
+    # If AP sends one early, hold it until the matching in-game location has been checked.
+    # This allows us to have progression there, and it prevents the need to manually send these locations.
+    HOLD_MISSABLE_ITEMS = {
+        'Cardboard Box A': 'cbox_a_location_counter',
+        'Cardboard Box B': 'cbox_b_location_counter',
+        'Cardboard Box C': 'cbox_c_location_counter',
+        'Night Vision Goggles': 'night_vision_goggles_location_counter',
+        'Thermal Goggles': 'thermal_goggles_location_counter',
+        'Gas Mask': 'gasmask_location_counter',
+        'Body Armor': 'body_armor_location_counter',
+        'Mine Detector': 'mine_detector_location_counter',
+        'Rope': 'rope_location_counter',
+        'Suppressor': 'suppressor_location_counter',
+    }
 
     def __init__(self):
         super().__init__()
@@ -111,7 +150,7 @@ class MetalGearSolidClient(BizHawkClient):
         self.kill_mantis_command = False
         self.current_region = ''
 
-        self.save_file = Path('.').joinpath('worlds').joinpath('mgs').joinpath('mgs_archipelago_save.json').resolve()
+        self.save_file = Path(user_path('mgs_archipelago_save.json'))
         if self.save_file.exists():
             with open(self.save_file) as save:
                 try:
@@ -127,8 +166,170 @@ class MetalGearSolidClient(BizHawkClient):
                 json.dump(self.save_state, save)
 
         # The Archipelago Server has an ID for all locations in the multiworld, this creates a dictionary where location names get mapped to their ID on the server
+        self.save_state['region_item_location_names'] = self.build_region_item_location_names()
+        self.save_state.setdefault('viewed_pal_key_cutscene_text', [])
+        self.save_state.setdefault('medi_room_otacon_gifts_received', False)
+
         for server_location in self.bizhawk_ctx.server_locations:
             self.location_name_to_server_location_id[self.bizhawk_ctx.location_names.lookup_in_game(code=server_location, game_name='Metal Gear Solid')] = server_location
+
+        for full_name, server_location in list(self.location_name_to_server_location_id.items()):
+            if ' - ' in full_name:
+                short_name = full_name.rsplit(' - ', 1)[1]
+                self.location_name_to_server_location_id.setdefault(short_name, server_location)
+
+    def resolve_location_id(self, location_name: str) -> int | None:
+        # Direct lookup first. 
+		# This covers exact server names and the short helper names.
+        location_id = self.location_name_to_server_location_id.get(location_name)
+        if location_id is not None:
+            return location_id
+
+        # Known short-name aliases that should resolve to an AP location.
+        location_aliases = {
+            'BOSS: Metal Gear REX': 'Metal Gear REX - BOSS: Metal Gear REX',
+            'BOSS: Liquid Snake': 'Metal Gear REX - BOSS: Liquid Snake',
+        }
+
+        alias_name = location_aliases.get(location_name)
+        if alias_name is not None:
+            location_id = self.location_name_to_server_location_id.get(alias_name)
+            if location_id is not None:
+                return location_id
+
+        # Fall back to a unique suffix match instead of crashing.
+        suffix = f' - {location_name}'
+        matches = {
+            server_id
+            for full_name, server_id in self.location_name_to_server_location_id.items()
+            if full_name.endswith(suffix)
+        }
+
+        if len(matches) == 1:
+            return next(iter(matches))
+
+        if len(matches) > 1:
+            logger.info(f'[Metal Gear Solid] Location name is ambiguous on server: {location_name}')
+        else:
+            logger.info(f'[Metal Gear Solid] Location not found on server: {location_name}')
+
+        return None
+
+    def queue_location(self, location_name: str) -> bool:
+        location_id = self.resolve_location_id(location_name)
+
+        if location_id is None:
+            return False
+
+        if location_id not in self.locations_to_send:
+            self.locations_to_send.append(location_id)
+
+        return True
+
+    async def check_received_victory(self, ctx: "BizHawkClientContext") -> None:
+        """Report Game Completion as soon as the server sends the Victory item.
+        """
+        if self.run_goal != 0 or ctx.finished_game:
+            return
+
+        for item in ctx.items_received:
+            local_item_name = ctx.item_names.lookup_in_game(
+                code=item.item, game_name='Metal Gear Solid'
+            )
+            if local_item_name == 'Victory':
+                await ctx.send_msgs([{
+                    "cmd": "StatusUpdate",
+                    "status": ClientStatus.CLIENT_GOAL
+                }])
+                ctx.finished_game = True
+                return
+
+    def missable_location_has_been_sent(self, item_name: str) -> bool:
+        location_counter_name = self.HOLD_MISSABLE_ITEMS.get(item_name)
+        if location_counter_name is None:
+            return False
+
+        # These counters start at 1 and are incremented after the location is queued.
+        return self.save_state[location_counter_name] > 1
+
+    def hold_missable_item(self, item_name: str) -> bool:
+        if item_name not in self.HOLD_MISSABLE_ITEMS:
+            return False
+
+        return not self.missable_location_has_been_sent(item_name)
+
+    def give_missable_item(self, item_name: str, write_list: list) -> None:
+        match item_name:
+            case 'Cardboard Box A':
+                self.save_state['has_cbox_a'] = True
+                self.save_state['cbox_a_counter'] = 1
+                write_list.append((RAM.cbox_a_count_address, to_u16_bytes(self.save_state['cbox_a_counter']), 'MainRAM'))
+                write_list.append((RAM.cbox_a_death_count_address, to_u16_bytes(self.save_state['cbox_a_counter']), 'MainRAM'))
+            case 'Cardboard Box B':
+                self.save_state['has_cbox_b'] = True
+                self.save_state['cbox_b_counter'] = 1
+                write_list.append((RAM.cbox_b_count_address, to_u16_bytes(self.save_state['cbox_b_counter']), 'MainRAM'))
+                write_list.append((RAM.cbox_b_death_count_address, to_u16_bytes(self.save_state['cbox_b_counter']), 'MainRAM'))
+            case 'Cardboard Box C':
+                self.save_state['has_cbox_c'] = True
+                self.save_state['cbox_c_counter'] = 1
+                write_list.append((RAM.cbox_c_count_address, to_u16_bytes(self.save_state['cbox_c_counter']), 'MainRAM'))
+                write_list.append((RAM.cbox_c_death_count_address, to_u16_bytes(self.save_state['cbox_c_counter']), 'MainRAM'))
+            case 'Night Vision Goggles':
+                self.save_state['has_night_vision_goggles'] = True
+                self.save_state['night_vision_goggles_counter'] = 1
+                write_list.append((RAM.nvg_count_address, to_u16_bytes(self.save_state['night_vision_goggles_counter']), 'MainRAM'))
+                write_list.append((RAM.nvg_death_count_address, to_u16_bytes(self.save_state['night_vision_goggles_counter']), 'MainRAM'))
+            case 'Thermal Goggles':
+                self.save_state['has_thermal_goggles'] = True
+                self.save_state['thermal_goggles_counter'] = 1
+                write_list.append((RAM.therm_g_count_address, to_u16_bytes(self.save_state['thermal_goggles_counter']), 'MainRAM'))
+                write_list.append((RAM.therm_g_death_count_address, to_u16_bytes(self.save_state['thermal_goggles_counter']), 'MainRAM'))
+            case 'Gas Mask':
+                self.save_state['has_gasmask'] = True
+                self.save_state['gasmask_counter'] = 1
+                write_list.append((RAM.gasmask_count_address, to_u16_bytes(self.save_state['gasmask_counter']), 'MainRAM'))
+                write_list.append((RAM.gasmask_death_count_address, to_u16_bytes(self.save_state['gasmask_counter']), 'MainRAM'))
+            case 'Body Armor':
+                self.save_state['has_body_armor'] = True
+                self.save_state['body_armor_counter'] = 1
+                write_list.append((RAM.b_armor_count_address, to_u16_bytes(self.save_state['body_armor_counter']), 'MainRAM'))
+                write_list.append((RAM.b_armor_death_count_address, to_u16_bytes(self.save_state['body_armor_counter']), 'MainRAM'))
+            case 'Mine Detector':
+                self.save_state['has_mine_detector'] = True
+                self.save_state['mine_detector_counter'] = 1
+                write_list.append((RAM.mine_d_count_address, to_u16_bytes(self.save_state['mine_detector_counter']), 'MainRAM'))
+                write_list.append((RAM.mind_d_death_count_address, to_u16_bytes(self.save_state['mine_detector_counter']), 'MainRAM'))
+            case 'Rope':
+                self.save_state['has_rope'] = True
+                self.save_state['rope_counter'] = 1
+                write_list.append((RAM.rope_count_address, to_u16_bytes(self.save_state['rope_counter']), 'MainRAM'))
+                write_list.append((RAM.rope_death_count_address, to_u16_bytes(self.save_state['rope_counter']), 'MainRAM'))
+            case 'Suppressor':
+                self.save_state['has_suppressor'] = True
+                self.save_state['suppressor_counter'] = 1
+                write_list.append((RAM.suppressor_count_address, to_u16_bytes(self.save_state['suppressor_counter']), 'MainRAM'))
+                write_list.append((RAM.suppressor_death_count_address, to_u16_bytes(self.save_state['suppressor_counter']), 'MainRAM'))
+
+    def release_pending_missable_items(self, write_list: list) -> bool:
+        pending_items = self.save_state.get('pending_missable_items', [])
+        if not pending_items:
+            return False
+
+        still_waiting = []
+        release_items = False
+
+        for item_name in pending_items:
+            if self.missable_location_has_been_sent(item_name):
+                self.give_missable_item(item_name, write_list)
+                release_items = True
+                logger.info(f'[Metal Gear Solid] Released held AP item after location sent: {item_name}')
+            else:
+                still_waiting.append(item_name)
+
+        self.save_state['pending_missable_items'] = still_waiting
+        return release_items
+
 
     # A player could repeatedly reload an area where a ration pickup spawns and check all ration locations in the game
     # Prevent this by tracking item pickups per game region and limiting them
@@ -213,11 +414,11 @@ class MetalGearSolidClient(BizHawkClient):
             },
             'nuke bldg b1': {
                 'rations': 0,
-                'rations_max': 2,
+                'rations_max': 1,
                 'socom': 0,
                 'socom_max': 2,
                 'famas': 0,
-                'famas_max': 5,
+                'famas_max': 4,
                 'nikita': 0,
                 'nikita_max': 3,
                 'stun_grenade': 0,
@@ -248,6 +449,10 @@ class MetalGearSolidClient(BizHawkClient):
                 'night_vision_goggles_max': 1,
                 'gasmask': 0,
                 'gasmask_max': 1,
+                # Body Armor AP location is generated in Blast Furnace, but the
+                # vanilla Nuke Bldg B2 pickup can still exist. Allow either
+                # physical pickup to send the single Body Armor location
+				# since if you have don't have thermals they don't appear in Nuke B2
                 'body_armor': 0,
                 'body_armor_max': 1,
             },
@@ -273,7 +478,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'rations': 0,
                 'rations_max': 3,
                 'socom': 0,
-                'socom_max': 2,
+                'socom_max': 1,
                 'famas': 0,
                 'famas_max': 2,
                 'diazepam': 0,
@@ -293,7 +498,7 @@ class MetalGearSolidClient(BizHawkClient):
             },
             'medi room': {
                 'rations': 0,
-                'rations_max': 2,
+                'rations_max': 1,
                 'handkerchief': 0,
                 'handkerchief_max': 1,
                 'time_bomb': 0,
@@ -319,17 +524,14 @@ class MetalGearSolidClient(BizHawkClient):
                 'stinger': 0,
                 'stinger_max': 1,
             },
-            'twr wall a': {
-                'rations': 0,
-                'rations_max': 1,
-            },
+            'twr wall a': {},
             'walkway': {
                 'rations': 0,
-                'rations_max': 1,
+                'rations_max': 2,
                 'c4': 0,
                 'c4_max': 1,
                 'stinger': 0,
-                'stinger_max': 2,
+                'stinger_max': 1,
             },
             'comm twr b': {
                 'rations': 0,
@@ -363,7 +565,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'grenade': 0,
                 'grenade_max': 2,
                 'stun_grenade': 0,
-                'stun_grenade_max': 2,
+                'stun_grenade_max': 1,
                 'chaff_grenade': 0,
                 'chaff_grenade_max': 2,
                 'claymore': 0,
@@ -381,56 +583,59 @@ class MetalGearSolidClient(BizHawkClient):
                 'famas_max': 1,
                 'c4': 0,
                 'c4_max': 1,
+                # The alternate Body Armor pickup in Nuke B2 lvl 6 can still satisfy the check.
+                'body_armor': 0,
+                'body_armor_max': 1,
+                'stinger': 0,
+                'stinger_max': 2,
+                'chaff_grenade': 0,
+                'chaff_grenade_max': 1,
                 'stun_grenade': 0,
-                'stun_grenade_max': 4,
+                'stun_grenade_max': 2,
                 'nikita': 0,
                 'nikita_max': 2,
                 'psg1': 0,
-                'psg1_max': 4
+                'psg1_max': 2
             },
             'cargo elev.': {
                 'rations': 0,
-                'rations_max': 3,
+                'rations_max': 1,
                 'famas': 0,
                 'famas_max': 8,
                 'socom': 0,
-                'socom_max': 5,
+                'socom_max': 2,
                 'claymore': 0,
-                'claymore_max': 5,
-                'nikita': 0,
-                'nikita_max': 2,
-                'c4': 0,
-                'c4_max': 3,
+                'claymore_max': 3,
             },
             'warehouse': {
                 'rations': 0,
-                'rations_max': 3,
+                'rations_max': 1,
                 'stinger': 0,
-                'stinger_max': 4,
+                'stinger_max': 2,
                 'nikita': 0,
-                'nikita_max': 3,
+                'nikita_max': 2,
             },
             'warehouse nt': {
                 'rations': 0,
-                'rations_max': 2,
+                'rations_max': 1,
                 'stinger': 0,
                 'stinger_max': 4,
                 'chaff_grenade': 0,
-                'chaff_grenade_max': 4,
+                'chaff_grenade_max': 1,
             },
             # There are actually u.grnd base 1, 2, and 3, but current code doesn't pick up the number
             # Note the space after 'base' is important. The code picks up the space.
             'u.grnd base ': {
                 'rations': 0,
-                'rations_max': 4,
+                'rations_max': 1,
                 'socom': 0,
-                'socom_max': 6,
+                'socom_max': 3,
                 'famas': 0,
-                'famas_max': 8,
+                'famas_max': 4,
                 'chaff_grenade': 0,
-                'chaff_grenade_max': 6,
+                'chaff_grenade_max': 3,
                 'stinger': 0,
-                'stinger_max': 4,
+                'stinger_max': 2,
             },
             'cmnd room': {
                 'rations': 0,
@@ -453,10 +658,106 @@ class MetalGearSolidClient(BizHawkClient):
         }
         return checks_per_region_tracker
 
+
+    def build_region_item_location_names(self) -> dict[str, dict[str, list[str]]]:
+        region_aliases = {
+            'Docks': 'dock',
+            'Heliport': 'heliport',
+            'Tank Hangar': 'tank hangar',
+            'Tank Hangar_lvl1': 'tank hangar',
+            'Tank Hangar_lvl2': 'tank hangar',
+            'Cell': 'cell',
+            'Cell_lvl1': 'cell',
+            'Armory': 'armory',
+            'Armory_lvl1': 'armory',
+            'Armory_lvl2': 'armory',
+            'Armory_lvl3': 'armory',
+            'Armory_lvl5': 'armory',
+            'Armory Sth': 'armory sth',
+            'Canyon': 'canyon',
+            'Nuke Building 1': 'nuke bldg 1',
+            'Nuke Building B1': 'nuke bldg b1',
+            'Nuke Building B1 lvl4': 'nuke bldg b1',
+            'Nuke Building B1 lvl5': 'nuke bldg b1',
+            'Nuke Building B2': 'nuke bldg b2',
+            'Nuke Building B2 lvl4': 'nuke bldg b2',
+            'Nuke Building B2 lvl6': 'nuke bldg b2',
+            'Lab': 'lab',
+            'Commander Room': 'cmnder room',
+            'Cave': 'cave',
+            'Underground Passage': 'u.grnd pssge',
+            'Medi Room': 'medi room',
+            'Comm Tower A': 'comm twr a',
+            'Roof/Comm Tw': 'roof/comm tw',
+            'Comm Tower B Roof': 'roof/comm tw',
+            'Twr Wall A': 'twr wall a',
+            'Walkway': 'walkway',
+            'Comm Tower B': 'comm twr b',
+            'Comm Tower B (Hind D[efeated])': 'comm twr b',
+            'Snow Field': 'snowfield',
+            'Snow Field (sans Wolf)': 'snowfield',
+            'Blast Furnace': 'blast furnac',
+            'Cargo Elev.': 'cargo elev.',
+            'Cargo Elevator': 'cargo elev.',
+            'Warehouse': 'warehouse',
+            'Warehouse North': 'warehouse nt',
+            'U.Ground Base': 'u.grnd base ',
+            'Underground Base': 'u.grnd base ',
+            'Command Room': 'cmnd room',
+            'Cmnd Room': 'cmnd room',
+            'Metal Gear REX': 'spply rte.',
+            'Spply Rte.': 'spply rte.',
+            'Esc Route': 'esc route',
+            'Escape Route': 'esc route',
+        }
+        item_prefix_to_key = {
+            'Ration': 'rations',
+            'Medicine': 'medicine',
+            'Diazepam': 'diazepam',
+            'SOCOM': 'socom',
+            'FA-MAS': 'famas',
+            'Grenade': 'grenade',
+            'Nikita': 'nikita',
+            'Stinger': 'stinger',
+            'Claymore': 'claymore',
+            'C4': 'c4',
+            'Stun Grenade': 'stun_grenade',
+            'Chaff Grenade': 'chaff_grenade',
+            'PSG-1': 'psg1',
+        }
+        region_item_location_names: dict[str, dict[str, list[str]]] = {}
+        for full_name in Regions.build_location_name_to_id_table().keys():
+            if ' - ' not in full_name:
+                continue
+            region_name, location_name = full_name.rsplit(' - ', 1)
+            if region_name not in region_aliases:
+                continue
+            matched_prefix = None
+            for prefix in item_prefix_to_key.keys():
+                if location_name.startswith(prefix + ' '):
+                    matched_prefix = prefix
+                    break
+            if matched_prefix is None:
+                continue
+            region_key = region_aliases[region_name]
+            item_key = item_prefix_to_key[matched_prefix]
+            region_item_location_names.setdefault(region_key, {}).setdefault(item_key, []).append(full_name)
+        return region_item_location_names
+
+    def get_next_region_location_name(self, region_name: str, item_key: str) -> str | None:
+        region_checks = self.save_state['checks_per_region_tracker'][region_name]
+        region_item_locations = self.save_state['region_item_location_names'].get(region_name, {})
+        item_locations = region_item_locations.get(item_key, [])
+        item_index = region_checks.get(item_key, 0)
+        if item_index < len(item_locations):
+            return item_locations[item_index]
+        return None
+
     # Various game states are placed into a dictionary and saved as a json file so that runs can be saved and reloaded.
     def initalize_save_data(self):
         save_state : dict[str, Any] = {
             'received_item_counter': 0,
+            'pending_missable_items': [],
             'has_cbox_a': False,
             'cbox_a_counter': 0,
             'has_cbox_b': False,
@@ -523,7 +824,7 @@ class MetalGearSolidClient(BizHawkClient):
             'body_armor_location_counter': 1,
             'body_armor_max_location_counter': 1,
             'rations_location_counter': 1,
-            'rations_max_location_counter': 43,
+            'rations_max_location_counter': 42,
             'medicine_location_counter': 1,
             'medicine_max_location_counter': 1,
             'diazepam_location_counter': 1,
@@ -543,15 +844,15 @@ class MetalGearSolidClient(BizHawkClient):
             'suppressor_location_counter': 1,
             'suppressor_max_location_counter': 1,
             'socom_location_counter': 1,
-            'socom_max_location_counter': 38,
+            'socom_max_location_counter': 37,
             'famas_location_counter': 1,
             'famas_max_location_counter': 46,
             'grenade_location_counter': 1,
             'grenade_max_location_counter': 11,
             'nikita_location_counter': 1,
-            'nikita_max_location_counter': 14,
+            'nikita_max_location_counter': 15,
             'stinger_location_counter': 1,
-            'stinger_max_location_counter': 17,
+            'stinger_max_location_counter': 18,
             'claymore_location_counter': 1,
             'claymore_max_location_counter': 9,
             'c4_location_counter': 1,
@@ -559,14 +860,16 @@ class MetalGearSolidClient(BizHawkClient):
             'stun_grenade_location_counter': 1,
             'stun_grenade_max_location_counter': 9,
             'chaff_grenade_location_counter': 1,
-            'chaff_grenade_max_location_counter': 15,
+            'chaff_grenade_max_location_counter': 16,
             'psg1_location_counter': 1,
             'psg1_max_location_counter': 18,
             'viewed_boss_cutscene_bytes': [],
             'viewed_key_card_cutscene_text': [],
+            'viewed_pal_key_cutscene_text': [],
             'is_captured': False,
             'has_snowfield': False,
             'checks_per_region_tracker': self.build_checks_per_region(),
+            'region_item_location_names': self.build_region_item_location_names(),
             'last_region': None,
             }
         save_state['regions'] = [key for key in save_state['checks_per_region_tracker'].keys()]
@@ -595,7 +898,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['cbox_a_counter']
-            write_list.append((RAM.cbox_a_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.cbox_a_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'cbox_a' in region_checks.keys():
                 if region_checks['cbox_a'] < region_checks['cbox_a_max'] and self.save_state['cbox_a_location_counter'] <= self.save_state['cbox_a_max_location_counter']:
@@ -605,9 +908,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['cbox_a'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['cbox_a']} of {region_checks['cbox_a_max']} Cardboard Box A in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['cbox_a']} of {region_checks['cbox_a_max']} Cardboard Box A in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Cardboard Box A not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Cardboard Box A not found in: {read_values['current_region_name']}")
 
         # Cardboard Box B
         if read_values['cbox_b_held'] != 0xFFFF and read_values['cbox_b_held'] > self.save_state['cbox_b_counter']:
@@ -615,7 +918,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['cbox_b_counter']
-            write_list.append((RAM.cbox_b_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.cbox_b_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'cbox_b' in region_checks.keys():
                 if region_checks['cbox_b'] < region_checks['cbox_b_max'] and self.save_state['cbox_b_location_counter'] <= self.save_state['cbox_b_max_location_counter']:
@@ -625,9 +928,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['cbox_b'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['cbox_b']} of {region_checks['cbox_b_max']} Cardboard Box B in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['cbox_b']} of {region_checks['cbox_b_max']} Cardboard Box B in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Cardboard Box B not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Cardboard Box B not found in: {read_values['current_region_name']}")
 
         # Cardboard Box C
         if read_values['cbox_c_held'] != 0xFFFF and read_values['cbox_c_held'] > self.save_state['cbox_c_counter']:
@@ -635,7 +938,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['cbox_c_counter']
-            write_list.append((RAM.cbox_c_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.cbox_c_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'cbox_c' in region_checks.keys():
                 if region_checks['cbox_c'] < region_checks['cbox_c_max'] and self.save_state['cbox_c_location_counter'] <= self.save_state['cbox_c_max_location_counter']:
@@ -645,9 +948,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['cbox_c'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['cbox_c']} of {region_checks['cbox_c_max']} Cardboard Box C in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['cbox_c']} of {region_checks['cbox_c_max']} Cardboard Box C in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Cardboard Box C not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Cardboard Box C not found in: {read_values['current_region_name']}")
 
         # Night Vision Goggles
         if read_values['night_vision_goggles_held'] != 0xFFFF and read_values['night_vision_goggles_held'] > self.save_state['night_vision_goggles_counter']:
@@ -655,7 +958,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['night_vision_goggles_counter']
-            write_list.append((RAM.nvg_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.nvg_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'night_vision_goggles' in region_checks.keys():
                 if region_checks['night_vision_goggles'] < region_checks['night_vision_goggles_max'] and self.save_state['night_vision_goggles_location_counter'] <= self.save_state['night_vision_goggles_max_location_counter']:
@@ -665,9 +968,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['night_vision_goggles'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['night_vision_goggles']} of {region_checks['night_vision_goggles_max']} Night Vision Goggles in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['night_vision_goggles']} of {region_checks['night_vision_goggles_max']} Night Vision Goggles in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Night Vision Goggles not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Night Vision Goggles not found in: {read_values['current_region_name']}")
 
         # Thermal Goggles
         if read_values['thermal_goggles_held'] != 0xFFFF and read_values['thermal_goggles_held'] > self.save_state['thermal_goggles_counter']:
@@ -675,7 +978,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['thermal_goggles_counter']
-            write_list.append((RAM.therm_g_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.therm_g_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'thermal_goggles' in region_checks.keys():
                 if region_checks['thermal_goggles'] < region_checks['thermal_goggles_max'] and self.save_state['thermal_goggles_location_counter'] <= self.save_state['thermal_goggles_max_location_counter']:
@@ -685,9 +988,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['thermal_goggles'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['thermal_goggles']} of {region_checks['thermal_goggles_max']} Thermal Goggles in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['thermal_goggles']} of {region_checks['thermal_goggles_max']} Thermal Goggles in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Thermal Goggles not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Thermal Goggles not found in: {read_values['current_region_name']}")
 
         # Gasmask
         if read_values['gasmask_held'] != 0xFFFF and read_values['gasmask_held'] > self.save_state['gasmask_counter']:
@@ -695,7 +998,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['gasmask_counter']
-            write_list.append((RAM.gasmask_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.gasmask_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'gasmask' in region_checks.keys():
                 if region_checks['gasmask'] < region_checks['gasmask_max'] and self.save_state['gasmask_location_counter'] <= self.save_state['gasmask_max_location_counter']:
@@ -705,9 +1008,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['gasmask'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['gasmask']} of {region_checks['gasmask_max']} Gasmask in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['gasmask']} of {region_checks['gasmask_max']} Gasmask in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Gas Mask not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Gas Mask not found in: {read_values['current_region_name']}")
 
         # Body Armor
         if read_values['body_armor_held'] != 0xFFFF and read_values['body_armor_held'] > self.save_state['body_armor_counter']:
@@ -715,7 +1018,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['body_armor_counter']
-            write_list.append((RAM.b_armor_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.b_armor_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'body_armor' in region_checks.keys():
                 if region_checks['body_armor'] < region_checks['body_armor_max'] and self.save_state['body_armor_location_counter'] <= self.save_state['body_armor_max_location_counter']:
@@ -725,63 +1028,70 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['body_armor'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['body_armor']} of {region_checks['body_armor_max']} Body Armor in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['body_armor']} of {region_checks['body_armor_max']} Body Armor in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Body Armor not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Body Armor not found in: {read_values['current_region_name']}")
 
         # Rations
         if read_values['rations_held'] != 0xFFFF and read_values['rations_held'] > self.save_state['rations_counter']:
-            write_list.append((RAM.rations_count_address, self.save_state['rations_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.rations_count_address, to_u16_bytes(self.save_state['rations_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'rations' in region_checks.keys():
-                if region_checks['rations'] < region_checks['rations_max'] and self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter']:
-                    location_name = 'Ration ' + str(self.save_state['rations_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['rations_location_counter'] += 1
-                    region_checks['rations'] += 1
-                    has_state_changed = True
+                if region_checks['rations'] < region_checks['rations_max']:
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'rations')
+                    if location_name is not None:
+                        if self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter'] or read_values['current_region_name'] == 'esc route':
+                            self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                            if self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter']:
+                                self.save_state['rations_location_counter'] += 1
+                            region_checks['rations'] += 1
+                            has_state_changed = True
+                        else:
+                            logger.info(f"[Metal Gear Solid] Ration location counter exhausted ({self.save_state['rations_location_counter']} > {self.save_state['rations_max_location_counter']}) before sending {location_name} in {read_values['current_region_name']}!")
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['rations']} of {region_checks['rations_max']} Rations in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['rations']} of {region_checks['rations_max']} Rations in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Rations not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Rations not found in: {read_values['current_region_name']}")
         elif read_values['rations_held'] < self.save_state['rations_counter']:
             self.save_state['rations_counter'] = read_values['rations_held']
             has_state_changed = True
 
         # Medicine
         if read_values['medicine_held'] != 0xFFFF and read_values['medicine_held'] > self.save_state['medicine_counter']:
-            write_list.append((RAM.medicine_count_address, self.save_state['medicine_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.medicine_count_address, to_u16_bytes(self.save_state['medicine_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'medicine' in region_checks.keys():
                 if region_checks['medicine'] < region_checks['medicine_max'] and self.save_state['medicine_location_counter'] <= self.save_state['medicine_max_location_counter']:
-                    location_name = 'Medicine ' + str(self.save_state['medicine_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['medicine_location_counter'] += 1
-                    region_checks['medicine'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'medicine')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['medicine_location_counter'] += 1
+                        region_checks['medicine'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['medicine']} of {region_checks['medicine_max']} Medicine in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['medicine']} of {region_checks['medicine_max']} Medicine in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Medicine not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Medicine not found in: {read_values['current_region_name']}")
         elif read_values['medicine_held'] < self.save_state['medicine_counter']:
             self.save_state['medicine_counter'] = read_values['medicine_held']
             has_state_changed = True
 
         # Diazepam
         if read_values['diazepam_held'] != 0xFFFF and read_values['diazepam_held'] > self.save_state['diazepam_counter']:
-            write_list.append((RAM.diazepam_count_address, self.save_state['diazepam_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.diazepam_count_address, to_u16_bytes(self.save_state['diazepam_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'diazepam' in region_checks.keys():
                 if region_checks['diazepam'] < region_checks['diazepam_max'] and self.save_state['diazepam_location_counter'] <= self.save_state['diazepam_max_location_counter']:
-                    location_name = 'Diazepam ' + str(self.save_state['diazepam_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['diazepam_location_counter'] += 1
-                    region_checks['diazepam'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'diazepam')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['diazepam_location_counter'] += 1
+                        region_checks['diazepam'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['diazepam']} of {region_checks['diazepam_max']} Diazepam in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['diazepam']} of {region_checks['diazepam_max']} Diazepam in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Diazepam not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Diazepam not found in: {read_values['current_region_name']}")
         elif read_values['diazepam_held'] < self.save_state['diazepam_counter']:
             self.save_state['diazepam_counter'] = read_values['diazepam_held']
             has_state_changed = True
@@ -790,29 +1100,31 @@ class MetalGearSolidClient(BizHawkClient):
         # Pal Key
         # Can be received during a cutscene. If the player doesn't already have a Pal Key in their inventory, this check works all the rest.
         # If the player does have a Pal Key, then the location will be sent when the cutscene is loaded.
+        self.save_state.setdefault('viewed_pal_key_cutscene_text', [])
+        self.save_state.setdefault('medi_room_otacon_gifts_received', False)
+        pal_key_location_unsent = self.save_state['pal_key_location_counter'] <= self.save_state['pal_key_max_location_counter']
+
         if read_values['pal_key_held'] != 0xFFFF and read_values['pal_key_held'] > self.save_state['pal_key_counter']:
-            write_list.append((RAM.pal_key_count_address, self.save_state['pal_key_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
-            if 'pal_key' in region_checks.keys():
-                if region_checks['pal_key'] < region_checks['pal_key_max'] and self.save_state['pal_key_location_counter'] <= self.save_state['pal_key_max_location_counter']:
-                    location_name = 'Pal Key'
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['pal_key_location_counter'] += 1
-                    region_checks['pal_key'] += 1
-                    has_state_changed = True
-                # The player gets the Pal Key twice in the game. Once from Meryl and once when they pick it up after losing it.
-                # I was going to allow for multiple location checks for the Pal Key but the logic is difficult for a single location check.
-                # else:
-                #     logger.info(f'[Metal Gear Solid] Already picked up {region_checks['pal_key']} of {region_checks['pal_key_max']} Pal Key in {read_values['current_region_name']}!')
-            # else:
-            #     logger.info(f'[Metal Gear Solid] Pal Key not found in: {read_values['current_region_name']}')
-        # This elif purposefully doesn't add 'current_cutscene_text' to 'viewed_key_card_cutscene_text' because it would prevent the logic for Key Card Level 5 later on in the code from triggering 
-        elif read_values['current_cutscene_bytes'] == RAM.key_card_level_5_cutscene_bytes and read_values['current_cutscene_text'] not in self.save_state['viewed_key_card_cutscene_text'] and self.save_state['pal_key_counter'] >= 1:
-            location_name = 'Pal Key'
-            self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-            self.save_state['pal_key_location_counter'] = 1
-            self.save_state['checks_per_region_tracker']['nuke bldg b1']['pal_key'] = 1
-            has_state_changed = True
+            write_list.append((RAM.pal_key_count_address, to_u16_bytes(self.save_state['pal_key_counter']), 'MainRAM'))
+            if pal_key_location_unsent and self.queue_location('Pal Key'):
+                self.save_state['pal_key_location_counter'] = self.save_state['pal_key_max_location_counter'] + 1
+                if 'nuke bldg b1' in self.save_state['checks_per_region_tracker'] and 'pal_key' in self.save_state['checks_per_region_tracker']['nuke bldg b1']:
+                    self.save_state['checks_per_region_tracker']['nuke bldg b1']['pal_key'] = self.save_state['checks_per_region_tracker']['nuke bldg b1']['pal_key_max']
+                has_state_changed = True
+        # If AP already gave the player a Pal Key, the in-game PAL pickup may not
+        # increase RAM. In that case, use the Meryl/PAL cutscene line as the check.
+        # Keep this separate from viewed_key_card_cutscene_text because the same text
+        # is also used by Key Card Level 5 handling.
+        elif (read_values['current_cutscene_bytes'] == RAM.key_card_level_5_cutscene_bytes
+              and read_values['current_cutscene_text'] not in self.save_state['viewed_pal_key_cutscene_text']
+              and self.save_state['pal_key_counter'] >= 1
+              and pal_key_location_unsent):
+            if self.queue_location('Pal Key'):
+                self.save_state['pal_key_location_counter'] = self.save_state['pal_key_max_location_counter'] + 1
+                if 'nuke bldg b1' in self.save_state['checks_per_region_tracker'] and 'pal_key' in self.save_state['checks_per_region_tracker']['nuke bldg b1']:
+                    self.save_state['checks_per_region_tracker']['nuke bldg b1']['pal_key'] = self.save_state['checks_per_region_tracker']['nuke bldg b1']['pal_key_max']
+                self.save_state['viewed_pal_key_cutscene_text'].append(read_values['current_cutscene_text'])
+                has_state_changed = True
         # Handle loss - Technically the player does get their Pal Key taken away from them, but I'm ignoring that.
         # elif read_values['pal_key_held'] < self.save_state['pal_key_counter']:
         #     self.save_state['pal_key_counter'] = read_values['pal_key_held']
@@ -820,17 +1132,27 @@ class MetalGearSolidClient(BizHawkClient):
 
         # Key Card
         # NOTE: No regional check for pickups. Should be impossible to pickup key cards multiple times as they trigger during cutscenes
+        # Several Key Card cutscenes were popping the wrong Key Card i.e. Gray Fox would pop Meryl's Key Card
+        # This didn't matter before the region rewrite since they were just named "Key Card"
+        # So identify the level from the cutscene text itself whenever possible 
+		# rather than trusting whatever number the counter happens to be sitting on
+		# we'll just send the appropriate one when we see certain bytes
         if read_values['key_card_held'] != 0xFFFF and read_values['key_card_held'] > self.save_state['key_card_counter']:
-            write_list.append((RAM.key_card_count_address, self.save_state['key_card_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.key_card_count_address, to_u16_bytes(self.save_state['key_card_counter']), 'MainRAM'))
             if self.save_state['key_card_location_counter'] <= self.save_state['key_card_max_location_counter']:
-                location_name = 'Key Card Level ' + str(self.save_state['key_card_location_counter'])
-                self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                self.save_state['key_card_location_counter'] += 1
-                has_state_changed = True
+                identified_level = KEY_CARD_LEVEL_BY_CUTSCENE_BYTES.get(read_values['current_cutscene_bytes'])
+                if identified_level is not None:
+                    location_name = f'Key Card Level {identified_level}'
+                    next_key_card_location_counter = max(self.save_state['key_card_location_counter'], identified_level + 1)
+
+                if self.queue_location(location_name):
+                    self.save_state['key_card_location_counter'] = next_key_card_location_counter
+                    self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
+                    has_state_changed = True
         # When a cutscene gives keycard level 1, it will set keycard count to 1 in RAM
         # Ensure the player cannot 'lose' keycard levels
         elif read_values['key_card_held'] < self.save_state['key_card_counter']:
-            write_list.append((RAM.key_card_count_address, self.save_state['key_card_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.key_card_count_address, to_u16_bytes(self.save_state['key_card_counter']), 'MainRAM'))
             has_state_changed = True
         # If the player currently has a keycard level greater than or equal to the keycard level provided by a cutscene, the location check won't trigger naturally.
         # check for cutscene text when the current keycard level is higher than what is expected naturally
@@ -848,23 +1170,27 @@ class MetalGearSolidClient(BizHawkClient):
                     location_name = 'Key Card Level 2'
                     self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['key_card_location_counter'] += 1
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
                     has_state_changed = True
             elif read_values['current_cutscene_bytes'] == RAM.key_card_level_3_cutscene_bytes and self.save_state['key_card_counter'] >= 3:
                 if self.save_state['key_card_location_counter'] <= self.save_state['key_card_max_location_counter']:
-                    location_name = 'Key Card Level 3'
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['key_card_location_counter'] += 1
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
-                    has_state_changed = True
+                    m1_tank_location = 'BOSS: M1 Tank'
+                    key_card_level_3_location = 'Key Card Level 3'
+                    m1_tank_location_id = self.location_name_to_server_location_id[m1_tank_location]
+
+                    if m1_tank_location_id not in self.bizhawk_ctx.server_locations and m1_tank_location_id not in self.locations_to_send:
+                        self.locations_to_send += [m1_tank_location_id]
+
+                    if m1_tank_location_id in self.bizhawk_ctx.server_locations or m1_tank_location_id in self.locations_to_send:
+                        self.locations_to_send += [self.location_name_to_server_location_id[key_card_level_3_location]]
+                        self.save_state['key_card_location_counter'] += 1
+                        self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
+                        has_state_changed = True
             elif read_values['current_cutscene_bytes'] == RAM.key_card_level_4_cutscene_bytes and self.save_state['key_card_counter'] >= 4:
                 if self.save_state['key_card_location_counter'] <= self.save_state['key_card_max_location_counter']:
                     location_name = 'Key Card Level 4'
                     self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['key_card_location_counter'] += 1
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
                     has_state_changed = True
             elif read_values['current_cutscene_bytes'] == RAM.key_card_level_5_cutscene_bytes and self.save_state['key_card_counter'] >= 5:
@@ -872,7 +1198,6 @@ class MetalGearSolidClient(BizHawkClient):
                     location_name = 'Key Card Level 5'
                     self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['key_card_location_counter'] += 1
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
                     has_state_changed = True
             elif read_values['current_cutscene_bytes'] == RAM.key_card_level_6_cutscene_bytes and self.save_state['key_card_counter'] >= 6:
@@ -880,7 +1205,6 @@ class MetalGearSolidClient(BizHawkClient):
                     location_name = 'Key Card Level 6'
                     self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['key_card_location_counter'] += 1
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
                     has_state_changed = True
             elif read_values['current_cutscene_bytes'] == RAM.key_card_level_7_cutscene_bytes and self.save_state['key_card_counter'] >= 7:
@@ -888,14 +1212,13 @@ class MetalGearSolidClient(BizHawkClient):
                     location_name = 'Key Card Level 7'
                     self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['key_card_location_counter'] += 1
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
                     has_state_changed = True
 
         # I thought it would be funny to trigger a location check for picking up the time bomb but this happens during the part of the game where the client's item pickup checks are disabled
         # Time Bomb
         # if read_values['time_bomb_held'] != 0xFFFF and read_values['time_bomb_held'] > self.save_state['time_bomb_counter']:
-        #     write_list.append((RAM.time_bomb_count_address, self.save_state['time_bomb_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+        #     write_list.append((RAM.time_bomb_count_address, to_u16_bytes(self.save_state['time_bomb_counter']), 'MainRAM'))
         #     region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
         #     if 'time_bomb' in region_checks.keys():
         #         if region_checks['time_bomb'] < region_checks['time_bomb_max'] and self.save_state['time_bomb_location_counter'] <= self.save_state['time_bomb_max_location_counter']:
@@ -905,9 +1228,9 @@ class MetalGearSolidClient(BizHawkClient):
         #             region_checks['time_bomb'] += 1
         #             has_state_changed = True
         #         else:
-        #             logger.info(f'[Metal Gear Solid] Already picked up {region_checks['time_bomb']} of {region_checks['time_bomb_max']} Time Bomb in {read_values['current_region_name']}!')
+        #             logger.info(f"[Metal Gear Solid] Already picked up {region_checks['time_bomb']} of {region_checks['time_bomb_max']} Time Bomb in {read_values['current_region_name']}!")
         #     else:
-        #         logger.info(f'[Metal Gear Solid] Time Bomb not found in: {read_values['current_region_name']}')
+        #         logger.info(f"[Metal Gear Solid] Time Bomb not found in: {read_values['current_region_name']}")
         # elif read_values['time_bomb_held'] < self.save_state['time_bomb_counter']:
         #     self.save_state['time_bomb_counter'] = read_values['time_bomb_held']
         #     has_state_changed = True
@@ -918,7 +1241,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['mine_detector_counter']
-            write_list.append((RAM.mine_d_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.mine_d_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'mine_detector' in region_checks.keys():
                 if region_checks['mine_detector'] < region_checks['mine_detector_max'] and self.save_state['mine_detector_location_counter'] <= self.save_state['mine_detector_max_location_counter']:
@@ -928,9 +1251,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['mine_detector'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['mine_detector']} of {region_checks['mine_detector_max']} Mine Detector in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['mine_detector']} of {region_checks['mine_detector_max']} Mine Detector in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Mine Detector not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Mine Detector not found in: {read_values['current_region_name']}")
 
         # Rope
         if read_values['rope_held'] != 0xFFFF and read_values['rope_held'] > self.save_state['rope_counter']:
@@ -938,7 +1261,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['rope_counter']
-            write_list.append((RAM.rope_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.rope_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'rope' in region_checks.keys():
                 if region_checks['rope'] < region_checks['rope_max'] and self.save_state['rope_location_counter'] <= self.save_state['rope_max_location_counter']:
@@ -948,16 +1271,16 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['rope'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['rope']} of {region_checks['rope_max']} Rope in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['rope']} of {region_checks['rope_max']} Rope in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Rope not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Rope not found in: {read_values['current_region_name']}")
         elif read_values['rope_held'] < self.save_state['rope_counter']:
             self.save_state['rope_counter'] = read_values['rope_held']
             has_state_changed = True
 
         # Handkerchief
         if read_values['handkerchief_held'] != 0xFFFF and read_values['handkerchief_held'] > self.save_state['handkerchief_counter']:
-            write_list.append((RAM.handkerchief_count_address, self.save_state['handkerchief_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.handkerchief_count_address, to_u16_bytes(self.save_state['handkerchief_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'handkerchief' in region_checks.keys():
                 if region_checks['handkerchief'] < region_checks['handkerchief_max'] and self.save_state['handkerchief_location_counter'] <= self.save_state['handkerchief_max_location_counter']:
@@ -967,9 +1290,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['handkerchief'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['handkerchief']} of {region_checks['handkerchief_max']} Handkerchief in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['handkerchief']} of {region_checks['handkerchief_max']} Handkerchief in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Handkerchief not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Handkerchief not found in: {read_values['current_region_name']}")
         elif read_values['handkerchief_held'] < self.save_state['handkerchief_counter']:
             self.save_state['handkerchief_counter'] = read_values['handkerchief_held']
             has_state_changed = True
@@ -980,7 +1303,7 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['suppressor_counter']
-            write_list.append((RAM.suppressor_count_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.suppressor_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'suppressor' in region_checks.keys():
                 if region_checks['suppressor'] < region_checks['suppressor_max'] and self.save_state['suppressor_location_counter'] <= self.save_state['suppressor_max_location_counter']:
@@ -990,9 +1313,9 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['suppressor'] += 1
                     has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['suppressor']} of {region_checks['suppressor_max']} Suppressor in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['suppressor']} of {region_checks['suppressor_max']} Suppressor in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Suppressor not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Suppressor not found in: {read_values['current_region_name']}")
         elif read_values['suppressor_held'] < self.save_state['suppressor_counter']:
             self.save_state['suppressor_counter'] = read_values['suppressor_held']
             has_state_changed = True
@@ -1003,19 +1326,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['socom_counter']
-            write_list.append((RAM.socom_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.socom_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'socom' in region_checks.keys():
                 if region_checks['socom'] < region_checks['socom_max'] and self.save_state['socom_location_counter'] <= self.save_state['socom_max_location_counter']:
-                    location_name = 'SOCOM ' + str(self.save_state['socom_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['socom_location_counter'] += 1
-                    region_checks['socom'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'socom')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['socom_location_counter'] += 1
+                        region_checks['socom'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['socom']} of {region_checks['socom_max']} SOCOM in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['socom']} of {region_checks['socom_max']} SOCOM in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] SOCOM not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] SOCOM not found in: {read_values['current_region_name']}")
         elif read_values['socom_ammo_held'] < self.save_state['socom_counter']:
             self.save_state['socom_counter'] = read_values['socom_ammo_held']
             has_state_changed = True
@@ -1028,19 +1352,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['famas_counter']
-            write_list.append((RAM.famas_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.famas_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'famas' in region_checks.keys():
                 if region_checks['famas'] < region_checks['famas_max'] and self.save_state['famas_location_counter'] <= self.save_state['famas_max_location_counter']:
-                    location_name = 'FA-MAS ' + str(self.save_state['famas_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['famas_location_counter'] += 1
-                    region_checks['famas'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'famas')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['famas_location_counter'] += 1
+                        region_checks['famas'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['famas']} of {region_checks['famas_max']} FA-MAS in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['famas']} of {region_checks['famas_max']} FA-MAS in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] FA-MAS not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] FA-MAS not found in: {read_values['current_region_name']}")
         elif read_values['famas_ammo_held'] < self.save_state['famas_counter']:
             self.save_state['famas_counter'] = read_values['famas_ammo_held']
             has_state_changed = True
@@ -1053,19 +1378,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['grenade_counter']
-            write_list.append((RAM.grenade_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.grenade_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'grenade' in region_checks.keys():
                 if region_checks['grenade'] < region_checks['grenade_max'] and self.save_state['grenade_location_counter'] <= self.save_state['grenade_max_location_counter']:
-                    location_name = 'Grenade ' + str(self.save_state['grenade_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['grenade_location_counter'] += 1
-                    region_checks['grenade'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'grenade')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['grenade_location_counter'] += 1
+                        region_checks['grenade'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['grenade']} of {region_checks['grenade_max']} Grenade in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['grenade']} of {region_checks['grenade_max']} Grenade in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Grenade not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Grenade not found in: {read_values['current_region_name']}")
         elif read_values['grenade_ammo_held'] < self.save_state['grenade_counter']:
             self.save_state['grenade_counter'] = read_values['grenade_ammo_held']
             has_state_changed = True
@@ -1076,19 +1402,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['nikita_counter']
-            write_list.append((RAM.nikita_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.nikita_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'nikita' in region_checks.keys():
                 if region_checks['nikita'] < region_checks['nikita_max'] and self.save_state['nikita_location_counter'] <= self.save_state['nikita_max_location_counter']:
-                    location_name = 'Nikita ' + str(self.save_state['nikita_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['nikita_location_counter'] += 1
-                    region_checks['nikita'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'nikita')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['nikita_location_counter'] += 1
+                        region_checks['nikita'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['nikita']} of {region_checks['nikita_max']} Nikita in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['nikita']} of {region_checks['nikita_max']} Nikita in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Nikita not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Nikita not found in: {read_values['current_region_name']}")
         elif read_values['nikita_ammo_held'] < self.save_state['nikita_counter']:
             self.save_state['nikita_counter'] = read_values['nikita_ammo_held']
             has_state_changed = True
@@ -1099,19 +1426,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['stinger_counter']
-            write_list.append((RAM.stinger_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.stinger_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'stinger' in region_checks.keys():
                 if region_checks['stinger'] < region_checks['stinger_max'] and self.save_state['stinger_location_counter'] <= self.save_state['stinger_max_location_counter']:
-                    location_name = 'Stinger ' + str(self.save_state['stinger_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['stinger_location_counter'] += 1
-                    region_checks['stinger'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'stinger')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['stinger_location_counter'] += 1
+                        region_checks['stinger'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['stinger']} of {region_checks['stinger_max']} Stinger in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['stinger']} of {region_checks['stinger_max']} Stinger in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Stinger not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Stinger not found in: {read_values['current_region_name']}")
         elif read_values['stinger_ammo_held'] < self.save_state['stinger_counter']:
             self.save_state['stinger_counter'] = read_values['stinger_ammo_held']
             has_state_changed = True
@@ -1122,19 +1450,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['claymore_counter']
-            write_list.append((RAM.claymore_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.claymore_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'claymore' in region_checks.keys():
                 if region_checks['claymore'] < region_checks['claymore_max'] and self.save_state['claymore_location_counter'] <= self.save_state['claymore_max_location_counter']:
-                    location_name = 'Claymore ' + str(self.save_state['claymore_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['claymore_location_counter'] += 1
-                    region_checks['claymore'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'claymore')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['claymore_location_counter'] += 1
+                        region_checks['claymore'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['claymore']} of {region_checks['claymore_max']} Claymore in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['claymore']} of {region_checks['claymore_max']} Claymore in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Claymore not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Claymore not found in: {read_values['current_region_name']}")
         elif read_values['claymore_ammo_held'] < self.save_state['claymore_counter']:
             self.save_state['claymore_counter'] = read_values['claymore_ammo_held']
             has_state_changed = True
@@ -1145,19 +1474,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['c4_counter']
-            write_list.append((RAM.c4_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.c4_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'c4' in region_checks.keys():
                 if region_checks['c4'] < region_checks['c4_max'] and self.save_state['c4_location_counter'] <= self.save_state['c4_max_location_counter']:
-                    location_name = 'C4 ' + str(self.save_state['c4_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['c4_location_counter'] += 1
-                    region_checks['c4'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'c4')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['c4_location_counter'] += 1
+                        region_checks['c4'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['c4']} of {region_checks['c4_max']} C4 in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['c4']} of {region_checks['c4_max']} C4 in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] C4 not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] C4 not found in: {read_values['current_region_name']}")
         elif read_values['c4_ammo_held'] < self.save_state['c4_counter']:
             self.save_state['c4_counter'] = read_values['c4_ammo_held']
             has_state_changed = True
@@ -1168,19 +1498,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['stun_grenade_counter']
-            write_list.append((RAM.stun_g_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'stun_grenade' in region_checks.keys():
                 if region_checks['stun_grenade'] < region_checks['stun_grenade_max'] and self.save_state['stun_grenade_location_counter'] <= self.save_state['stun_grenade_max_location_counter']:
-                    location_name = 'Stun Grenade ' + str(self.save_state['stun_grenade_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['stun_grenade_location_counter'] += 1
-                    region_checks['stun_grenade'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'stun_grenade')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['stun_grenade_location_counter'] += 1
+                        region_checks['stun_grenade'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['stun_grenade']} of {region_checks['stun_grenade_max']} Stun Grenade in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['stun_grenade']} of {region_checks['stun_grenade_max']} Stun Grenade in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Stun Grenade not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Stun Grenade not found in: {read_values['current_region_name']}")
         elif read_values['stun_grenade_held'] < self.save_state['stun_grenade_counter']:
             self.save_state['stun_grenade_counter'] = read_values['stun_grenade_held']
             has_state_changed = True
@@ -1191,19 +1522,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['chaff_grenade_counter']
-            write_list.append((RAM.chaff_g_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.chaff_g_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'chaff_grenade' in region_checks.keys():
                 if region_checks['chaff_grenade'] < region_checks['chaff_grenade_max'] and self.save_state['chaff_grenade_location_counter'] <= self.save_state['chaff_grenade_max_location_counter']:
-                    location_name = 'Chaff Grenade ' + str(self.save_state['chaff_grenade_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['chaff_grenade_location_counter'] += 1
-                    region_checks['chaff_grenade'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'chaff_grenade')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['chaff_grenade_location_counter'] += 1
+                        region_checks['chaff_grenade'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['chaff_grenade']} of {region_checks['chaff_grenade_max']} Chaff Grenade in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['chaff_grenade']} of {region_checks['chaff_grenade_max']} Chaff Grenade in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] Chaff Grenade not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] Chaff Grenade not found in: {read_values['current_region_name']}")
         elif read_values['chaff_grenade_held'] < self.save_state['chaff_grenade_counter']:
             self.save_state['chaff_grenade_counter'] = read_values['chaff_grenade_held']
             has_state_changed = True
@@ -1214,19 +1546,20 @@ class MetalGearSolidClient(BizHawkClient):
                 write_value = 65535
             else:
                 write_value = self.save_state['psg1_counter']
-            write_list.append((RAM.psg1_ammo_address, write_value.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.psg1_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'psg1' in region_checks.keys():
                 if region_checks['psg1'] < region_checks['psg1_max'] and self.save_state['psg1_location_counter'] <= self.save_state['psg1_max_location_counter']:
-                    location_name = 'PSG-1 ' + str(self.save_state['psg1_location_counter'])
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                    self.save_state['psg1_location_counter'] += 1
-                    region_checks['psg1'] += 1
-                    has_state_changed = True
+                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'psg1')
+                    if location_name is not None:
+                        self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                        self.save_state['psg1_location_counter'] += 1
+                        region_checks['psg1'] += 1
+                        has_state_changed = True
                 else:
-                    logger.info(f'[Metal Gear Solid] Already picked up {region_checks['psg1']} of {region_checks['psg1_max']} PSG-1 in {read_values['current_region_name']}!')
+                    logger.info(f"[Metal Gear Solid] Already picked up {region_checks['psg1']} of {region_checks['psg1_max']} PSG-1 in {read_values['current_region_name']}!")
             else:
-                logger.info(f'[Metal Gear Solid] PSG-1 not found in: {read_values['current_region_name']}')
+                logger.info(f"[Metal Gear Solid] PSG-1 not found in: {read_values['current_region_name']}")
         elif read_values['psg1_ammo_held'] < self.save_state['psg1_counter']:
             self.save_state['psg1_counter'] = read_values['psg1_ammo_held']
             has_state_changed = True
@@ -1264,6 +1597,11 @@ class MetalGearSolidClient(BizHawkClient):
         # Don't run game_watcher if not connected to an archipelago server
         if ctx.server is None or ctx.server.socket.closed or ctx.slot_data is None or ctx.auth is None:
             return
+
+        # Goal completion is from receiving the locked Victory item. 
+		# It didn't seem to want to pop before, so let's "force it" the same way
+		# we do in RE3 basically
+        await self.check_received_victory(ctx)
         
         # === HANDLE RAM READING === #
         reads_dict = {
@@ -1272,7 +1610,7 @@ class MetalGearSolidClient(BizHawkClient):
             'cbox_b_held': (RAM.cbox_b_count_address, 2, 'MainRAM'),
             'cbox_b_on_death': (RAM.cbox_b_death_count_address, 2, 'MainRAM'),
             'cbox_c_held': (RAM.cbox_c_count_address, 2, 'MainRAM'),
-            'cbox_c_on_death': (RAM.cbox_b_death_count_address, 2, 'MainRAM'),
+            'cbox_c_on_death': (RAM.cbox_c_death_count_address, 2, 'MainRAM'),
             'night_vision_goggles_held': (RAM.nvg_count_address, 2, 'MainRAM'),
             'night_vision_goggles_on_death': (RAM.nvg_death_count_address, 2, 'MainRAM'),
             'thermal_goggles_held': (RAM.therm_g_count_address, 2, 'MainRAM'),
@@ -1384,8 +1722,25 @@ class MetalGearSolidClient(BizHawkClient):
                     self.locations_to_send += [self.location_name_to_server_location_id['Handkerchief']]
                     
                     self.save_state['key_card_location_counter'] += 1
-                    self.save_state['key_card_counter'] += 1
                     self.locations_to_send += [self.location_name_to_server_location_id['Key Card Level 6']]
+
+                    # Otacon's scripted Level 6 card is a location check, not a
+                    # progressive Key Card item. Keep the AP-owned key-card level
+                    # unchanged; if this location contains a Key Card, the normal
+                    # received-item path will increase it exactly once.
+                    key_card_write_value = self.save_state['key_card_counter']
+                    if 0x8000 <= read_values['key_card_held'] < 0xFFFF:
+                        key_card_write_value |= 0x8000
+                    write_list.append((
+                        RAM.key_card_count_address,
+                        to_u16_bytes(key_card_write_value),
+                        'MainRAM'
+                    ))
+                    write_list.append((
+                        RAM.key_card_death_count_address,
+                        to_u16_bytes(self.save_state['key_card_counter']),
+                        'MainRAM'
+                    ))
 
                     self.save_state['rations_location_counter'] += 1
                     self.save_state['rations_counter'] += 1
@@ -1393,7 +1748,17 @@ class MetalGearSolidClient(BizHawkClient):
                     has_state_changed = True
                     
                 else:
-                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.queue_location(location_name)
+                    if location_name == 'BOSS: Gray Fox':
+                        if self.queue_location('Key Card Level 4'):
+                            self.save_state['key_card_location_counter'] = max(self.save_state['key_card_location_counter'], 5)
+                            if current_cutscene_text not in self.save_state['viewed_key_card_cutscene_text']:
+                                self.save_state['viewed_key_card_cutscene_text'].append(current_cutscene_text)
+                    elif location_name == 'BOSS: Vulcan Raven':
+                        if self.queue_location('Key Card Level 7'):
+                            self.save_state['key_card_location_counter'] = max(self.save_state['key_card_location_counter'], 8)
+                            if current_cutscene_text not in self.save_state['viewed_key_card_cutscene_text']:
+                                self.save_state['viewed_key_card_cutscene_text'].append(current_cutscene_text)
                 assert isinstance(self.save_state['viewed_boss_cutscene_bytes'],list) # stops IDEs from complaining that save_state['viewed_boss_cutscene_bytes'] might not return a list.
                 self.save_state['viewed_boss_cutscene_bytes'].append(current_cutscene_text)
                 has_state_changed = True
@@ -1454,7 +1819,7 @@ class MetalGearSolidClient(BizHawkClient):
         if self.kill_mantis_command:
             if current_region_name == 'cmnder room':
                 zero = 0x0000
-                write_list.append((RAM.psyco_mantis_current_health, zero.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.psyco_mantis_current_health, to_u16_bytes(zero), 'MainRAM'))
                 if ctx.slot:
                     # Techinically a cheat. I think it should be announced just like other cheat console commands
                     await ctx.send_msgs([{
@@ -1470,85 +1835,85 @@ class MetalGearSolidClient(BizHawkClient):
         # Not doing this can cause the handle_item_pickups() function to assume the player has lost all their ammo
         if self.run_once:
             if self.save_state['has_cbox_a']:
-                write_list.append((RAM.cbox_a_count_address, self.save_state['cbox_a_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.cbox_a_death_count_address, self.save_state['cbox_a_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.cbox_a_count_address, to_u16_bytes(self.save_state['cbox_a_counter']), 'MainRAM'))
+                write_list.append((RAM.cbox_a_death_count_address, to_u16_bytes(self.save_state['cbox_a_counter']), 'MainRAM'))
             if self.save_state['has_cbox_b']:
-                write_list.append((RAM.cbox_b_count_address, self.save_state['cbox_b_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.cbox_b_death_count_address, self.save_state['cbox_b_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.cbox_b_count_address, to_u16_bytes(self.save_state['cbox_b_counter']), 'MainRAM'))
+                write_list.append((RAM.cbox_b_death_count_address, to_u16_bytes(self.save_state['cbox_b_counter']), 'MainRAM'))
             if self.save_state['has_cbox_c']:
-                write_list.append((RAM.cbox_c_count_address, self.save_state['cbox_c_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.cbox_c_death_count_address, self.save_state['cbox_c_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.cbox_c_count_address, to_u16_bytes(self.save_state['cbox_c_counter']), 'MainRAM'))
+                write_list.append((RAM.cbox_c_death_count_address, to_u16_bytes(self.save_state['cbox_c_counter']), 'MainRAM'))
             if self.save_state['has_night_vision_goggles']:
-                write_list.append((RAM.nvg_count_address, self.save_state['night_vision_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.nvg_death_count_address, self.save_state['night_vision_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.nvg_count_address, to_u16_bytes(self.save_state['night_vision_goggles_counter']), 'MainRAM'))
+                write_list.append((RAM.nvg_death_count_address, to_u16_bytes(self.save_state['night_vision_goggles_counter']), 'MainRAM'))
             if self.save_state['has_thermal_goggles']:
-                write_list.append((RAM.therm_g_count_address, self.save_state['thermal_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.therm_g_death_count_address, self.save_state['thermal_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.therm_g_count_address, to_u16_bytes(self.save_state['thermal_goggles_counter']), 'MainRAM'))
+                write_list.append((RAM.therm_g_death_count_address, to_u16_bytes(self.save_state['thermal_goggles_counter']), 'MainRAM'))
             if self.save_state['has_gasmask']:
-                write_list.append((RAM.gasmask_count_address, self.save_state['gasmask_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.gasmask_death_count_address, self.save_state['gasmask_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.gasmask_count_address, to_u16_bytes(self.save_state['gasmask_counter']), 'MainRAM'))
+                write_list.append((RAM.gasmask_death_count_address, to_u16_bytes(self.save_state['gasmask_counter']), 'MainRAM'))
             if self.save_state['has_body_armor']:
-                write_list.append((RAM.b_armor_count_address, self.save_state['body_armor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.b_armor_death_count_address, self.save_state['body_armor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.rations_count_address, self.save_state['rations_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.rations_death_count_address, self.save_state['rations_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.medicine_count_address, self.save_state['medicine_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.medicine_death_count_address, self.save_state['medicine_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.diazepam_count_address, self.save_state['diazepam_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.diazepam_death_count_address, self.save_state['diazepam_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.pal_key_count_address, self.save_state['pal_key_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.pal_key_death_count_address, self.save_state['pal_key_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.key_card_count_address, self.save_state['key_card_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.key_card_death_count_address, self.save_state['key_card_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.b_armor_count_address, to_u16_bytes(self.save_state['body_armor_counter']), 'MainRAM'))
+                write_list.append((RAM.b_armor_death_count_address, to_u16_bytes(self.save_state['body_armor_counter']), 'MainRAM'))
+            write_list.append((RAM.rations_count_address, to_u16_bytes(self.save_state['rations_counter']), 'MainRAM'))
+            write_list.append((RAM.rations_death_count_address, to_u16_bytes(self.save_state['rations_counter']), 'MainRAM'))
+            write_list.append((RAM.medicine_count_address, to_u16_bytes(self.save_state['medicine_counter']), 'MainRAM'))
+            write_list.append((RAM.medicine_death_count_address, to_u16_bytes(self.save_state['medicine_counter']), 'MainRAM'))
+            write_list.append((RAM.diazepam_count_address, to_u16_bytes(self.save_state['diazepam_counter']), 'MainRAM'))
+            write_list.append((RAM.diazepam_death_count_address, to_u16_bytes(self.save_state['diazepam_counter']), 'MainRAM'))
+            write_list.append((RAM.pal_key_count_address, to_u16_bytes(self.save_state['pal_key_counter']), 'MainRAM'))
+            write_list.append((RAM.pal_key_death_count_address, to_u16_bytes(self.save_state['pal_key_counter']), 'MainRAM'))
+            write_list.append((RAM.key_card_count_address, to_u16_bytes(self.save_state['key_card_counter']), 'MainRAM'))
+            write_list.append((RAM.key_card_death_count_address, to_u16_bytes(self.save_state['key_card_counter']), 'MainRAM'))
             if self.save_state['has_mine_detector']:
-                write_list.append((RAM.mine_d_count_address, self.save_state['mine_detector_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.mind_d_death_count_address, self.save_state['mine_detector_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.mine_d_count_address, to_u16_bytes(self.save_state['mine_detector_counter']), 'MainRAM'))
+                write_list.append((RAM.mind_d_death_count_address, to_u16_bytes(self.save_state['mine_detector_counter']), 'MainRAM'))
             if self.save_state['has_rope']:
-                write_list.append((RAM.rope_count_address, self.save_state['rope_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.rope_death_count_address, self.save_state['rope_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.handkerchief_count_address, self.save_state['handkerchief_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-            write_list.append((RAM.handkerchief_death_count_address, self.save_state['handkerchief_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.rope_count_address, to_u16_bytes(self.save_state['rope_counter']), 'MainRAM'))
+                write_list.append((RAM.rope_death_count_address, to_u16_bytes(self.save_state['rope_counter']), 'MainRAM'))
+            write_list.append((RAM.handkerchief_count_address, to_u16_bytes(self.save_state['handkerchief_counter']), 'MainRAM'))
+            write_list.append((RAM.handkerchief_death_count_address, to_u16_bytes(self.save_state['handkerchief_counter']), 'MainRAM'))
             if self.save_state['has_suppressor']:
-                write_list.append((RAM.suppressor_count_address, self.save_state['suppressor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.suppressor_death_count_address, self.save_state['suppressor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.suppressor_count_address, to_u16_bytes(self.save_state['suppressor_counter']), 'MainRAM'))
+                write_list.append((RAM.suppressor_death_count_address, to_u16_bytes(self.save_state['suppressor_counter']), 'MainRAM'))
             if self.save_state['has_socom']:
-                write_list.append((RAM.socom_ammo_address, self.save_state['socom_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.socom_death_ammo_address, self.save_state['socom_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.socom_ammo_address, to_u16_bytes(self.save_state['socom_counter']), 'MainRAM'))
+                write_list.append((RAM.socom_death_ammo_address, to_u16_bytes(self.save_state['socom_counter']), 'MainRAM'))
             if self.save_state['has_famas']:
-                write_list.append((RAM.famas_ammo_address, self.save_state['famas_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.famas_death_ammo_address, self.save_state['famas_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.famas_ammo_address, to_u16_bytes(self.save_state['famas_counter']), 'MainRAM'))
+                write_list.append((RAM.famas_death_ammo_address, to_u16_bytes(self.save_state['famas_counter']), 'MainRAM'))
             if self.save_state['has_grenade']:
-                write_list.append((RAM.grenade_ammo_address, self.save_state['grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.grenade_death_ammo_address, self.save_state['grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.grenade_ammo_address, to_u16_bytes(self.save_state['grenade_counter']), 'MainRAM'))
+                write_list.append((RAM.grenade_death_ammo_address, to_u16_bytes(self.save_state['grenade_counter']), 'MainRAM'))
             if self.save_state['has_nikita']:
-                write_list.append((RAM.nikita_ammo_address, self.save_state['nikita_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.nikita_death_ammo_address, self.save_state['nikita_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.nikita_ammo_address, to_u16_bytes(self.save_state['nikita_counter']), 'MainRAM'))
+                write_list.append((RAM.nikita_death_ammo_address, to_u16_bytes(self.save_state['nikita_counter']), 'MainRAM'))
             if self.save_state['has_stinger']:
-                write_list.append((RAM.stinger_ammo_address, self.save_state['stinger_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.stinger_death_ammo_address, self.save_state['stinger_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.stinger_ammo_address, to_u16_bytes(self.save_state['stinger_counter']), 'MainRAM'))
+                write_list.append((RAM.stinger_death_ammo_address, to_u16_bytes(self.save_state['stinger_counter']), 'MainRAM'))
             if self.save_state['has_claymore']:
-                write_list.append((RAM.claymore_ammo_address, self.save_state['claymore_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.claymore_death_ammo_address, self.save_state['claymore_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.claymore_ammo_address, to_u16_bytes(self.save_state['claymore_counter']), 'MainRAM'))
+                write_list.append((RAM.claymore_death_ammo_address, to_u16_bytes(self.save_state['claymore_counter']), 'MainRAM'))
             if self.save_state['has_c4']:
-                write_list.append((RAM.c4_ammo_address, self.save_state['c4_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.c4_death_ammo_address, self.save_state['c4_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.c4_ammo_address, to_u16_bytes(self.save_state['c4_counter']), 'MainRAM'))
+                write_list.append((RAM.c4_death_ammo_address, to_u16_bytes(self.save_state['c4_counter']), 'MainRAM'))
             if self.save_state['has_stun_grenade']:
-                write_list.append((RAM.stun_g_ammo_address, self.save_state['stun_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.stun_g_death_ammo_address, self.save_state['stun_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(self.save_state['stun_grenade_counter']), 'MainRAM'))
+                write_list.append((RAM.stun_g_death_ammo_address, to_u16_bytes(self.save_state['stun_grenade_counter']), 'MainRAM'))
             if self.save_state['has_chaff_grenade']:
-                write_list.append((RAM.chaff_g_ammo_address, self.save_state['chaff_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.chaff_g_death_ammo_address, self.save_state['chaff_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.chaff_g_ammo_address, to_u16_bytes(self.save_state['chaff_grenade_counter']), 'MainRAM'))
+                write_list.append((RAM.chaff_g_death_ammo_address, to_u16_bytes(self.save_state['chaff_grenade_counter']), 'MainRAM'))
             if self.save_state['has_psg1']:
-                write_list.append((RAM.psg1_ammo_address, self.save_state['psg1_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.psg1_death_ammo_address, self.save_state['psg1_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.psg1_ammo_address, to_u16_bytes(self.save_state['psg1_counter']), 'MainRAM'))
+                write_list.append((RAM.psg1_death_ammo_address, to_u16_bytes(self.save_state['psg1_counter']), 'MainRAM'))
             # === FOR DEBUG! === #
             if is_debug:
                 logger.info('[Metal Gear Solid] DEBUG MODE ENABLED!')
                 logger.info('[Metal Gear Solid] Stealth Camouflage, Bandana, Infinite Oxygen, and Infinite Health added!')
                 one = 1
-                write_list.append((RAM.stealth_count_address,  one.to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.bandana_count_address,  one.to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                write_list.append((RAM.current_health,  read_values['current_max_health'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.stealth_count_address,  to_u16_bytes(one), 'MainRAM'))
+                write_list.append((RAM.bandana_count_address,  to_u16_bytes(one), 'MainRAM'))
+                write_list.append((RAM.current_health,  to_u16_bytes(read_values['current_max_health']), 'MainRAM'))
             # Write these immediately before handle_item_pickups() is called
             await bizhawk.write(ctx.bizhawk_ctx, write_list)
             write_list.clear()
@@ -1557,50 +1922,50 @@ class MetalGearSolidClient(BizHawkClient):
         # === FOR DEBUG! === #
         if is_debug:
             if read_values['current_health'] < read_values['current_max_health']:
-                write_list.append((RAM.current_health, read_values['current_max_health'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.current_health, to_u16_bytes(read_values['current_max_health']), 'MainRAM'))
             # Health is tracked at a different location in RAM during the helicopter rappel. It's also somewhere different during the torture scene but I haven't found it yet.
             # This doesn't make failing the torture scene impossible. Just slow emulation speed to 75%!
             if read_values['current_region_name'] == 'twr wall a' or read_values['current_region_name'] == 'medi room':
                 if read_values['current_health_alt'] < read_values['current_max_health']:
-                    write_list.append((RAM.current_health_alt, read_values['current_max_health'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                    write_list.append((RAM.current_health_alt, to_u16_bytes(read_values['current_max_health']), 'MainRAM'))
             if read_values['stealth_camouflage_held'] < 1:
                 one = 1
-                write_list.append((RAM.stealth_count_address,  one.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.stealth_count_address,  to_u16_bytes(one), 'MainRAM'))
             if read_values['bandana_held'] < 1:
                 one = 1
-                write_list.append((RAM.bandana_count_address,  one.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.bandana_count_address,  to_u16_bytes(one), 'MainRAM'))
             if read_values['current_o2'] < 0x400:
                 four_hundred_hex = 0x400
-                write_list.append((RAM.current_oxygen_level,  four_hundred_hex.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.current_oxygen_level,  to_u16_bytes(four_hundred_hex), 'MainRAM'))
 
         # === ENSURE MAX ITEMS ARE HIGHER THAN NORMAL === #
         # The player cannot pickup an item if they're already carrying the maximum amount.
         # Having full FA-MAS ammo means the player cannot check any more FA-MAS locations!
         # Ensure that doesn't happen by upping the max item count to a large number
         if read_values['rations_max'] != self.max_items:
-            write_list.append((RAM.rations_max_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.rations_max_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['diazepam_max'] != self.max_items:
-            write_list.append((RAM.diazepam_max_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.diazepam_max_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['socom_max'] != self.max_items:
-            write_list.append((RAM.socom_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.socom_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['famas_max'] != self.max_items:
-            write_list.append((RAM.famas_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.famas_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['grenade_max'] != self.max_items:
-            write_list.append((RAM.grenade_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.grenade_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['nikita_max'] != self.max_items:
-            write_list.append((RAM.nikita_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.nikita_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['stinger_max'] != self.max_items:
-            write_list.append((RAM.stinger_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.stinger_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['claymore_max'] != self.max_items:
-            write_list.append((RAM.claymore_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.claymore_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['c4_max'] != self.max_items:
-            write_list.append((RAM.c4_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.c4_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['stun_grenade_max'] != self.max_items:
-            write_list.append((RAM.stun_g_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.stun_g_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['chaff_grenade_max'] != self.max_items:
-            write_list.append((RAM.chaff_g_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.chaff_g_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
         if read_values['psg1_max'] != self.max_items:
-            write_list.append((RAM.psg1_max_ammo_address, self.max_items.to_bytes(length=2, byteorder='little'), 'MainRAM'))
+            write_list.append((RAM.psg1_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
 
         
         has_state_changed = self.handle_item_pickups(read_values, write_list)
@@ -1614,112 +1979,115 @@ class MetalGearSolidClient(BizHawkClient):
             if read_values['cbox_a_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['cbox_a_counter'] = read_values['cbox_a_on_death']
-                write_list.append((RAM.cbox_a_count_address, read_values['cbox_a_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.cbox_a_count_address, to_u16_bytes(read_values['cbox_a_on_death']), 'MainRAM'))
             if read_values['cbox_b_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['cbox_b_counter'] = read_values['cbox_b_on_death']
-                write_list.append((RAM.cbox_b_count_address, read_values['cbox_b_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.cbox_b_count_address, to_u16_bytes(read_values['cbox_b_on_death']), 'MainRAM'))
             if read_values['cbox_c_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['cbox_c_counter'] = read_values['cbox_c_on_death']
-                write_list.append((RAM.cbox_c_count_address, read_values['cbox_c_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.cbox_c_count_address, to_u16_bytes(read_values['cbox_c_on_death']), 'MainRAM'))
             if read_values['night_vision_goggles_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['night_vision_goggles_counter'] = read_values['night_vision_goggles_on_death']
-                write_list.append((RAM.nvg_count_address, read_values['night_vision_goggles_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.nvg_count_address, to_u16_bytes(read_values['night_vision_goggles_on_death']), 'MainRAM'))
             if read_values['thermal_goggles_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['thermal_goggles_counter'] = read_values['thermal_goggles_on_death']
-                write_list.append((RAM.therm_g_count_address, read_values['thermal_goggles_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.therm_g_count_address, to_u16_bytes(read_values['thermal_goggles_on_death']), 'MainRAM'))
             if read_values['gasmask_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['gasmask_counter'] = read_values['gasmask_on_death']
-                write_list.append((RAM.gasmask_count_address, read_values['gasmask_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.gasmask_count_address, to_u16_bytes(read_values['gasmask_on_death']), 'MainRAM'))
             if read_values['body_armor_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['body_armor_counter'] = read_values['body_armor_on_death']
-                write_list.append((RAM.b_armor_count_address, read_values['body_armor_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.b_armor_count_address, to_u16_bytes(read_values['body_armor_on_death']), 'MainRAM'))
             if read_values['rations_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['rations_counter'] = read_values['rations_on_death']
-                write_list.append((RAM.rations_count_address, read_values['rations_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.rations_count_address, to_u16_bytes(read_values['rations_on_death']), 'MainRAM'))
             if read_values['medicine_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['medicine_counter'] = read_values['medicine_on_death']
-                write_list.append((RAM.medicine_count_address, read_values['medicine_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.medicine_count_address, to_u16_bytes(read_values['medicine_on_death']), 'MainRAM'))
             if read_values['diazepam_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['diazepam_counter'] = read_values['diazepam_on_death']
-                write_list.append((RAM.diazepam_count_address, read_values['diazepam_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.diazepam_count_address, to_u16_bytes(read_values['diazepam_on_death']), 'MainRAM'))
             if read_values['pal_key_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['pal_key_counter'] = read_values['pal_key_on_death']
-                write_list.append((RAM.pal_key_count_address, read_values['pal_key_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.pal_key_count_address, to_u16_bytes(read_values['pal_key_on_death']), 'MainRAM'))
             if read_values['key_card_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['key_card_counter'] = read_values['key_card_on_death']
-                write_list.append((RAM.key_card_count_address, read_values['key_card_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.key_card_count_address, to_u16_bytes(read_values['key_card_on_death']), 'MainRAM'))
             if read_values['mine_detector_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['mine_detector_counter'] = read_values['mine_detector_on_death']
-                write_list.append((RAM.mine_d_count_address, read_values['mine_detector_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.mine_d_count_address, to_u16_bytes(read_values['mine_detector_on_death']), 'MainRAM'))
             if read_values['rope_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['rope_counter'] = read_values['rope_on_death']
-                write_list.append((RAM.rope_count_address, read_values['rope_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.rope_count_address, to_u16_bytes(read_values['rope_on_death']), 'MainRAM'))
             if read_values['handkerchief_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['handkerchief_counter'] = read_values['handkerchief_on_death']
-                write_list.append((RAM.handkerchief_count_address, read_values['handkerchief_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.handkerchief_count_address, to_u16_bytes(read_values['handkerchief_on_death']), 'MainRAM'))
             if read_values['suppressor_on_death'] != 0xFFFF:
                 has_state_changed = True
                 self.save_state['suppressor_counter'] = read_values['suppressor_on_death']
-                write_list.append((RAM.suppressor_count_address, read_values['suppressor_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.suppressor_count_address, to_u16_bytes(read_values['suppressor_on_death']), 'MainRAM'))
             if self.save_state['has_socom']:
                 has_state_changed = True
                 self.save_state['socom_counter'] = read_values['socom_ammo_on_death']
-                write_list.append((RAM.socom_ammo_address, read_values['socom_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.socom_ammo_address, to_u16_bytes(read_values['socom_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_famas']:
                 has_state_changed = True
                 self.save_state['famas_counter'] = read_values['famas_ammo_on_death']
-                write_list.append((RAM.famas_ammo_address, read_values['famas_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.famas_ammo_address, to_u16_bytes(read_values['famas_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_grenade']:
                 has_state_changed = True
                 self.save_state['grenade_counter'] = read_values['grenade_ammo_on_death']
-                write_list.append((RAM.grenade_ammo_address, read_values['grenade_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.grenade_ammo_address, to_u16_bytes(read_values['grenade_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_nikita']:
                 has_state_changed = True
                 self.save_state['nikita_counter'] = read_values['nikita_ammo_on_death']
-                write_list.append((RAM.nikita_ammo_address, read_values['nikita_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.nikita_ammo_address, to_u16_bytes(read_values['nikita_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_stinger']:
                 has_state_changed = True
                 self.save_state['stinger_counter'] = read_values['stinger_ammo_on_death']
-                write_list.append((RAM.stinger_ammo_address, read_values['stinger_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.stinger_ammo_address, to_u16_bytes(read_values['stinger_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_claymore']:
                 has_state_changed = True
                 self.save_state['claymore_counter'] = read_values['claymore_ammo_on_death']
-                write_list.append((RAM.claymore_ammo_address, read_values['claymore_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.claymore_ammo_address, to_u16_bytes(read_values['claymore_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_c4']:
                 has_state_changed = True
                 self.save_state['c4_counter'] = read_values['c4_ammo_on_death']
-                write_list.append((RAM.c4_ammo_address, read_values['c4_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.c4_ammo_address, to_u16_bytes(read_values['c4_ammo_on_death']), 'MainRAM'))
             if self.save_state['has_stun_grenade']:
                 has_state_changed = True
                 self.save_state['stun_grenade_counter'] = read_values['stun_grenade_on_death']
-                write_list.append((RAM.stun_g_ammo_address, read_values['stun_grenade_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(read_values['stun_grenade_on_death']), 'MainRAM'))
             if self.save_state['has_chaff_grenade']:
                 has_state_changed = True
                 self.save_state['chaff_grenade_counter'] = read_values['chaff_grenade_on_death']
-                write_list.append((RAM.chaff_g_death_ammo_address, read_values['chaff_grenade_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.chaff_g_death_ammo_address, to_u16_bytes(read_values['chaff_grenade_on_death']), 'MainRAM'))
             if self.save_state['has_psg1']:
                 has_state_changed = True
                 self.save_state['psg1_counter'] = read_values['psg1_ammo_on_death']
-                write_list.append((RAM.psg1_ammo_address, read_values['psg1_ammo_on_death'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                write_list.append((RAM.psg1_ammo_address, to_u16_bytes(read_values['psg1_ammo_on_death']), 'MainRAM'))
 
         # === SEND LOCATION CHECKS === #
         if len(self.locations_to_send) > 0:
             await ctx.check_locations(self.locations_to_send)
             self.locations_to_send.clear()
+
+        if self.release_pending_missable_items(write_list):
+            has_state_changed = True
 
         # === HANDLE RECEIVED ITEMS === #
         # When receiving an item from the server, update the client's count for that item and write it to the game's RAM in both the current and 'on death' locations.
@@ -1734,122 +2102,93 @@ class MetalGearSolidClient(BizHawkClient):
                 item = ctx.items_received[i]
                 local_item_name = ctx.item_names.lookup_in_game(code=item.item, game_name='Metal Gear Solid')
                 self.save_state['received_item_counter'] += 1
+
+                if self.hold_missable_item(local_item_name):
+                    self.save_state.setdefault('pending_missable_items', []).append(local_item_name)
+                    logger.info(f'[Metal Gear Solid] Holding AP item until its location is checked: {local_item_name}')
+                    continue
+
                 match local_item_name:
-                    case 'Cardboard Box A':
-                        self.save_state['cbox_a_counter'] = 1
-                        write_list.append((RAM.cbox_a_count_address, self.save_state['cbox_a_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.cbox_a_death_count_address, self.save_state['cbox_a_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Cardboard Box B':
-                        self.save_state['cbox_b_counter'] = 1
-                        write_list.append((RAM.cbox_b_count_address, self.save_state['cbox_b_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.cbox_b_death_count_address, self.save_state['cbox_b_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Cardboard Box C':
-                        self.save_state['cbox_c_counter'] = 1
-                        write_list.append((RAM.cbox_c_count_address, self.save_state['cbox_c_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.cbox_c_death_count_address, self.save_state['cbox_c_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Night Vision Goggles':
-                        self.save_state['night_vision_goggles_counter'] = 1
-                        write_list.append((RAM.nvg_count_address, self.save_state['night_vision_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.nvg_death_count_address, self.save_state['night_vision_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Thermal Goggles':
-                        self.save_state['thermal_goggles_counter'] = 1
-                        write_list.append((RAM.therm_g_count_address, self.save_state['thermal_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.therm_g_death_count_address, self.save_state['thermal_goggles_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Gas Mask':
-                        self.save_state['gasmask_counter'] = 1
-                        write_list.append((RAM.gasmask_count_address, self.save_state['gasmask_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.gasmask_death_count_address, self.save_state['gasmask_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Body Armor':
-                        self.save_state['body_armor_counter'] = 1
-                        write_list.append((RAM.b_armor_count_address, self.save_state['body_armor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.b_armor_death_count_address, self.save_state['body_armor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                    case 'Cardboard Box A' | 'Cardboard Box B' | 'Cardboard Box C' | 'Night Vision Goggles' | 'Thermal Goggles' | 'Gas Mask' | 'Body Armor':
+                        self.give_missable_item(local_item_name, write_list)
                     case 'Ration':
-                        self.save_state['rations_counter'] += 2
-                        write_list.append((RAM.rations_count_address, self.save_state['rations_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.rations_death_count_address, self.save_state['rations_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['rations_counter'] = min(0xFFFF, self.save_state['rations_counter'] + 2)
+                        write_list.append((RAM.rations_count_address, to_u16_bytes(self.save_state['rations_counter']), 'MainRAM'))
+                        write_list.append((RAM.rations_death_count_address, to_u16_bytes(self.save_state['rations_counter']), 'MainRAM'))
                     case 'Medicine':
-                        self.save_state['medicine_counter'] += 3
-                        write_list.append((RAM.medicine_count_address, self.save_state['medicine_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.medicine_death_count_address, self.save_state['medicine_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['medicine_counter'] = min(0xFFFF, self.save_state['medicine_counter'] + 3)
+                        write_list.append((RAM.medicine_count_address, to_u16_bytes(self.save_state['medicine_counter']), 'MainRAM'))
+                        write_list.append((RAM.medicine_death_count_address, to_u16_bytes(self.save_state['medicine_counter']), 'MainRAM'))
                     case 'Diazepam':
-                        self.save_state['diazepam_counter'] += 3
-                        write_list.append((RAM.diazepam_count_address, self.save_state['diazepam_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.diazepam_death_count_address, self.save_state['diazepam_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['diazepam_counter'] = min(0xFFFF, self.save_state['diazepam_counter'] + 3)
+                        write_list.append((RAM.diazepam_count_address, to_u16_bytes(self.save_state['diazepam_counter']), 'MainRAM'))
+                        write_list.append((RAM.diazepam_death_count_address, to_u16_bytes(self.save_state['diazepam_counter']), 'MainRAM'))
                     case 'Pal Key':
                         self.save_state['pal_key_counter'] = 1
-                        write_list.append((RAM.pal_key_count_address, self.save_state['pal_key_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.pal_key_death_count_address, self.save_state['pal_key_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        write_list.append((RAM.pal_key_count_address, to_u16_bytes(self.save_state['pal_key_counter']), 'MainRAM'))
+                        write_list.append((RAM.pal_key_death_count_address, to_u16_bytes(self.save_state['pal_key_counter']), 'MainRAM'))
                     case 'Key Card':
-                        self.save_state['key_card_counter'] += 1
-                        write_list.append((RAM.key_card_count_address, self.save_state['key_card_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.key_card_death_count_address, self.save_state['key_card_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Mine Detector':
-                        self.save_state['mine_detector_counter'] = 1
-                        write_list.append((RAM.mine_d_count_address, self.save_state['mine_detector_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.mind_d_death_count_address, self.save_state['mine_detector_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                    case 'Rope':
-                        self.save_state['rope_counter'] = 1
-                        write_list.append((RAM.rope_count_address, self.save_state['rope_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.rope_death_count_address, self.save_state['rope_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['key_card_counter'] = min(0xFFFF, self.save_state['key_card_counter'] + 1)
+                        write_list.append((RAM.key_card_count_address, to_u16_bytes(self.save_state['key_card_counter']), 'MainRAM'))
+                        write_list.append((RAM.key_card_death_count_address, to_u16_bytes(self.save_state['key_card_counter']), 'MainRAM'))
+                    case 'Mine Detector' | 'Rope':
+                        self.give_missable_item(local_item_name, write_list)
                     case 'Handkerchief':
                         self.save_state['handkerchief_counter'] = 1
-                        write_list.append((RAM.handkerchief_count_address, self.save_state['handkerchief_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.handkerchief_death_count_address, self.save_state['handkerchief_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        write_list.append((RAM.handkerchief_count_address, to_u16_bytes(self.save_state['handkerchief_counter']), 'MainRAM'))
+                        write_list.append((RAM.handkerchief_death_count_address, to_u16_bytes(self.save_state['handkerchief_counter']), 'MainRAM'))
                     case 'Suppressor':
-                        self.save_state['has_suppressor'] = True
-                        self.save_state['suppressor_counter'] = 1
-                        write_list.append((RAM.suppressor_count_address, self.save_state['suppressor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.suppressor_death_count_address, self.save_state['suppressor_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.give_missable_item(local_item_name, write_list)
                     case 'SOCOM':
                         self.save_state['has_socom'] = True
-                        self.save_state['socom_counter'] += 24
-                        write_list.append((RAM.socom_ammo_address, self.save_state['socom_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.socom_death_ammo_address, self.save_state['socom_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['socom_counter'] = min(0xFFFF, self.save_state['socom_counter'] + 24)
+                        write_list.append((RAM.socom_ammo_address, to_u16_bytes(self.save_state['socom_counter']), 'MainRAM'))
+                        write_list.append((RAM.socom_death_ammo_address, to_u16_bytes(self.save_state['socom_counter']), 'MainRAM'))
                     case 'FA-MAS':
                         self.save_state['has_famas'] = True
-                        self.save_state['famas_counter'] += 35
-                        write_list.append((RAM.famas_ammo_address, self.save_state['famas_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.famas_death_ammo_address, self.save_state['famas_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['famas_counter'] = min(0xFFFF, self.save_state['famas_counter'] + 35)
+                        write_list.append((RAM.famas_ammo_address, to_u16_bytes(self.save_state['famas_counter']), 'MainRAM'))
+                        write_list.append((RAM.famas_death_ammo_address, to_u16_bytes(self.save_state['famas_counter']), 'MainRAM'))
                     case 'Grenade':
                         self.save_state['has_grenade'] = True
-                        self.save_state['grenade_counter'] += 3
-                        write_list.append((RAM.grenade_ammo_address, self.save_state['grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.grenade_death_ammo_address, self.save_state['grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['grenade_counter'] = min(0xFFFF, self.save_state['grenade_counter'] + 3)
+                        write_list.append((RAM.grenade_ammo_address, to_u16_bytes(self.save_state['grenade_counter']), 'MainRAM'))
+                        write_list.append((RAM.grenade_death_ammo_address, to_u16_bytes(self.save_state['grenade_counter']), 'MainRAM'))
                     case 'Nikita':
                         self.save_state['has_nikita'] = True
-                        self.save_state['nikita_counter'] += 10
-                        write_list.append((RAM.nikita_ammo_address, self.save_state['nikita_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.nikita_death_ammo_address, self.save_state['nikita_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['nikita_counter'] = min(0xFFFF, self.save_state['nikita_counter'] + 10)
+                        write_list.append((RAM.nikita_ammo_address, to_u16_bytes(self.save_state['nikita_counter']), 'MainRAM'))
+                        write_list.append((RAM.nikita_death_ammo_address, to_u16_bytes(self.save_state['nikita_counter']), 'MainRAM'))
                     case 'Stinger':
                         self.save_state['has_stinger'] = True
-                        self.save_state['stinger_counter'] += 10
-                        write_list.append((RAM.stinger_ammo_address, self.save_state['stinger_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.stinger_death_ammo_address, self.save_state['stinger_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['stinger_counter'] = min(0xFFFF, self.save_state['stinger_counter'] + 10)
+                        write_list.append((RAM.stinger_ammo_address, to_u16_bytes(self.save_state['stinger_counter']), 'MainRAM'))
+                        write_list.append((RAM.stinger_death_ammo_address, to_u16_bytes(self.save_state['stinger_counter']), 'MainRAM'))
                     case 'Claymore':
                         self.save_state['has_claymore'] = True
-                        self.save_state['claymore_counter'] += 10
-                        write_list.append((RAM.claymore_ammo_address, self.save_state['claymore_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.claymore_death_ammo_address, self.save_state['claymore_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['claymore_counter'] = min(0xFFFF, self.save_state['claymore_counter'] + 10)
+                        write_list.append((RAM.claymore_ammo_address, to_u16_bytes(self.save_state['claymore_counter']), 'MainRAM'))
+                        write_list.append((RAM.claymore_death_ammo_address, to_u16_bytes(self.save_state['claymore_counter']), 'MainRAM'))
                     case 'C4':
                         self.save_state['has_c4'] = True
-                        self.save_state['c4_counter'] += 10
-                        write_list.append((RAM.c4_ammo_address, self.save_state['c4_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.c4_death_ammo_address, self.save_state['c4_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['c4_counter'] = min(0xFFFF, self.save_state['c4_counter'] + 10)
+                        write_list.append((RAM.c4_ammo_address, to_u16_bytes(self.save_state['c4_counter']), 'MainRAM'))
+                        write_list.append((RAM.c4_death_ammo_address, to_u16_bytes(self.save_state['c4_counter']), 'MainRAM'))
                     case 'Stun Grenade':
                         self.save_state['has_stun_grenade'] = True
-                        self.save_state['stun_grenade_counter'] += 3
-                        write_list.append((RAM.stun_g_ammo_address, self.save_state['stun_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.stun_g_death_ammo_address, self.save_state['stun_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['stun_grenade_counter'] = min(0xFFFF, self.save_state['stun_grenade_counter'] + 3)
+                        write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(self.save_state['stun_grenade_counter']), 'MainRAM'))
+                        write_list.append((RAM.stun_g_death_ammo_address, to_u16_bytes(self.save_state['stun_grenade_counter']), 'MainRAM'))
                     case 'Chaff Grenade':
                         self.save_state['has_chaff_grenade'] = True
-                        self.save_state['chaff_grenade_counter'] += 5
-                        write_list.append((RAM.chaff_g_ammo_address, self.save_state['chaff_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.chaff_g_death_ammo_address, self.save_state['chaff_grenade_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['chaff_grenade_counter'] = min(0xFFFF, self.save_state['chaff_grenade_counter'] + 5)
+                        write_list.append((RAM.chaff_g_ammo_address, to_u16_bytes(self.save_state['chaff_grenade_counter']), 'MainRAM'))
+                        write_list.append((RAM.chaff_g_death_ammo_address, to_u16_bytes(self.save_state['chaff_grenade_counter']), 'MainRAM'))
                     case 'PSG-1':
                         self.save_state['has_psg1'] = True
-                        self.save_state['psg1_counter'] += 12
-                        write_list.append((RAM.psg1_ammo_address, self.save_state['psg1_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
-                        write_list.append((RAM.psg1_death_ammo_address, self.save_state['psg1_counter'].to_bytes(length=2, byteorder='little'), 'MainRAM'))
+                        self.save_state['psg1_counter'] = min(0xFFFF, self.save_state['psg1_counter'] + 12)
+                        write_list.append((RAM.psg1_ammo_address, to_u16_bytes(self.save_state['psg1_counter']), 'MainRAM'))
+                        write_list.append((RAM.psg1_death_ammo_address, to_u16_bytes(self.save_state['psg1_counter']), 'MainRAM'))
                     case 'Dogtag':
                         self.save_state['dogtag_counter'] += 1
                         if self.save_state['dogtag_counter'] == self.dogtag_goal and self.run_goal == 2: # option 2 is dogtag collection
@@ -1867,7 +2206,8 @@ class MetalGearSolidClient(BizHawkClient):
                             }])
                             ctx.finished_game = True
                     case 'Victory':
-                        if self.run_goal == 0: # option 0 is game completion
+                        # Basically force goal to send, since it was refusing sometimes
+                        if self.run_goal == 0 and not ctx.finished_game: # option 0 is game completion
                             await ctx.send_msgs([{
                                 "cmd": "StatusUpdate",
                                 "status": ClientStatus.CLIENT_GOAL

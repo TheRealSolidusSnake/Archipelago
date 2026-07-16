@@ -6,35 +6,40 @@ if TYPE_CHECKING:
     from . import MGSWorld
 
 def set_rules(world: 'MGSWorld') -> None:
-    # These locations can be missed
-    # Ensure the world generator doesn't put progression items at these locations
+    # These locations could be missed, but now we hold them until they're checked in-game
+    # We're leaving the list intact so we can roll it back at any given point
+	# but also because I'm lazy and it was a lot easier to just leave them like this XD
     missable_locations = [
-        world.get_location('Ration 1'),
-        world.get_location('Ration 2'),
-        world.get_location('Ration 3'),
-        world.get_location('Thermal Goggles'),
-        world.get_location('Night Vision Goggles'),
-        world.get_location('Cardboard Box A'),
-        world.get_location('Cardboard Box B'),
-        world.get_location('Cardboard Box C'),
-        world.get_location('Body Armor'),
-        world.get_location('Suppressor'),
-        world.get_location('Mine Detector'),
-        world.get_location('Gas Mask'),
-        world.get_location('Rope'),
+        world.get_location(world.get_full_location_name('Ration 1')),
+        world.get_location(world.get_full_location_name('Ration 2')),
+        world.get_location(world.get_full_location_name('Ration 3')),
+        world.get_location(world.get_full_location_name('Thermal Goggles')),
+        world.get_location(world.get_full_location_name('Night Vision Goggles')),
+        world.get_location(world.get_full_location_name('Cardboard Box A')),
+        world.get_location(world.get_full_location_name('Cardboard Box B')),
+        world.get_location(world.get_full_location_name('Cardboard Box C')),
+        world.get_location(world.get_full_location_name('Body Armor')),
+        world.get_location(world.get_full_location_name('Suppressor')),
+        world.get_location(world.get_full_location_name('Mine Detector')),
+        world.get_location(world.get_full_location_name('Gas Mask')),
+        world.get_location(world.get_full_location_name('Rope')),
     ]
+	
+    # Keep this list for documentation and easy rollback.
+    # The client now holds these items from the player until their physical pickup in-game
+    # has been checked, so progression items are now allowed at these locations.
 
-    for loc in missable_locations:
-        add_item_rule(loc, 
-                      lambda item: item.classification != ItemClassification.progression
-                      )
+    # for loc in missable_locations:
+    #     add_item_rule(loc, 
+    #                   lambda item: not item.advancement
+    #                   )
     
     # Ensure 'Victory' item is always received at the end of the game
-    world.get_location('The Best is Yet to Come').place_locked_item(world.create_item('Victory'))
+    world.get_location(world.get_full_location_name('The Best is Yet to Come')).place_locked_item(world.create_item('Victory'))
     # Used to prevent run generator from sending the player to fight the M1 Tank before fighting Ocelot
-    world.get_location('Ocelot Fight').place_locked_item(world.create_event('Ocelot Fight'))
+    world.get_location(world.get_full_location_name('Ocelot Fight')).place_locked_item(world.create_event('Ocelot Fight'))
     # Used to prevent run generator from sending the player to fight Psycho Mantis before fighting Gray Fox
-    world.get_location('Gray Fox Fight').place_locked_item(world.create_event('Gray Fox Fight'))
+    world.get_location(world.get_full_location_name('Gray Fox Fight')).place_locked_item(world.create_event('Gray Fox Fight'))
 
     # Ensure specific items have been received before certain points in the game.
     # Ex. C4 is required before fighting Ocelot
@@ -51,7 +56,12 @@ def set_rules(world: 'MGSWorld') -> None:
     set_rule(world.multiworld.get_entrance('armory_to_armory_lvl5', world.player),
              lambda state: state.has('Key Card', world.player, 5))
     set_rule(world.multiworld.get_entrance('armory_to_armory_sth', world.player),
-             lambda state: state.has('C4', world.player))
+             lambda state: state.has('C4', world.player)
+             and state.has('Key Card', world.player, 1))
+    set_rule(world.get_entrance('hangar_to_hangar_lvl1'),
+             lambda state: state.has('Key Card', world.player, 1))
+    set_rule(world.get_entrance('hangar_to_hangar_lvl2'),
+             lambda state: state.has('Key Card', world.player, 2))
     set_rule(world.multiworld.get_entrance('hangar_to_canyon', world.player),
              lambda state: state.has('Key Card', world.player, 2)
              and state.has('Chaff Grenade', world.player)
@@ -65,6 +75,8 @@ def set_rules(world: 'MGSWorld') -> None:
     set_rule(world.multiworld.get_entrance('nuke_building_b1_to_nuke_building_b2', world.player),
              lambda state: state.has('Nikita', world.player))
     set_rule(world.multiworld.get_entrance('nuke_building_b1_to_nuke_bulding_b1_lvl4', world.player),
+             lambda state: state.has('Key Card', world.player, 4))
+    set_rule(world.get_location(world.get_full_location_name('FA-MAS 7')),
              lambda state: state.has('Key Card', world.player, 4))
     set_rule(world.multiworld.get_entrance('nuke_building_b1_to_nuke_bulding_b1_lvl5', world.player),
              lambda state: state.has('Key Card', world.player, 5))
@@ -91,27 +103,27 @@ def set_rules(world: 'MGSWorld') -> None:
     set_rule(world.multiworld.get_entrance('underground_base_to_command_room', world.player),
              lambda state: state.has('Pal Key', world.player))
     set_rule(world.multiworld.get_entrance('under_ground_base_to_rex_battle', world.player),
-             lambda state: state.has('Stinger', world.player, 2))
+             lambda state: state.has('Stinger', world.player, 2) and state.has('Pal Key', world.player))
     
     # Tell the run generator which items are required for victory
     match world.run_goal:
         case 0: # Game Completion
             world.multiworld.completion_condition[world.player] = lambda state: state.has('Victory', world.player)
         case 1: # Boss Blitz
-            world.get_location('BOSS: Heavily Armed Genome Soldiers').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Revolver Ocelot').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: M1 Tank').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Gray Fox').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Psycho Mantis').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Sniper Wolf I').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Black-outfitted Genome Soldiers I').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: A Hind D?').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Stealth Camouflaged Genome Soldiers').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Sniper Wolf II').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Black-outfitted Genome Soldiers II').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Vulcan Raven').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Metal Gear REX').place_locked_item(world.create_item('Boss Dogtag'))
-            world.get_location('BOSS: Liquid Snake').place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Heavily Armed Genome Soldiers')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Revolver Ocelot')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: M1 Tank')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Gray Fox')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Psycho Mantis')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Sniper Wolf I')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Black-outfitted Genome Soldiers I')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: A Hind D?')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Stealth Camouflaged Genome Soldiers')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Sniper Wolf II')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Black-outfitted Genome Soldiers II')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Vulcan Raven')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Metal Gear REX')).place_locked_item(world.create_item('Boss Dogtag'))
+            world.get_location(world.get_full_location_name('BOSS: Liquid Snake')).place_locked_item(world.create_item('Boss Dogtag'))
             world.multiworld.completion_condition[world.player] = lambda state: state.has('Boss Dogtag', world.player, world.boss_goal)
         case 2: # Dogtag Collection
             world.multiworld.completion_condition[world.player] = lambda state: state.has('Dogtag', world.player, world.dogtag_goal)

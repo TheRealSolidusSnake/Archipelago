@@ -181,8 +181,9 @@ class RAM:
         b'\x4A\x75\x73\x74\x20\x61\x73\x20\x74\x68\x65\x20': 'BOSS: Vulcan Raven',
         b'\x53\x6E\x61\x6B\x65\x2C\x00\x00\x2C\x00\00\x00': 'BOSS: Metal Gear REX',
         b'\x53\x6E\x61\x61\x61\x61\x61\x61\x61\x61\x61\x6B': 'BOSS: Liquid Snake',
-        b'\x4D\x65\x72\x79\x6C\x2C\x00\x00\x20\x00\x00\x00': 'The Best is Yet to Come'
+        b'\x45\x61\x63\x68\x20\x70\x65\x72\x73\x6F\x6E\x20': 'The Best is Yet to Come' # Ending wouldn't pop on game completion, so now it's the Naomi section that plays in both endings
     }
+
     # value at 0xAE098 + 0x150000 leads to address that holds area string 
     current_region_low_offset_address = 0xAE098
     current_region_high_offset_address = 0xAE09A
