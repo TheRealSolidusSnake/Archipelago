@@ -6,6 +6,11 @@
 - [BizHawk](https://tasvideos.org/BizHawk/ReleaseHistory) the 2.9.1 version is recommended.
 - A legally obtained Metal Gear Solid ROM file (Disc 1 and Disc 2 of the Greatest Hits Version). The Archipelago community cannot provide this.
 
+## Optional Software
+
+- [Universal Tracker](https://github.com/FarisTheAncient/Archipelago/releases) - It helps newer players keep track of what they're supposed to be doing
+
+
 ## Generating a Multi-disk Bundle
 
 Use BizHawk to generate a Multi-disk bundle from the two ROM files.
