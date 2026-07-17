@@ -71,3 +71,5 @@ When loading a saved game, launch all programs and connect to the Archipelago se
 When starting a new run, the old `mgs_archipelago_save.json` file should be deleted, moved, or renamed to prevent the Metal Gear Solid Archipelago mod from loading previous save data.
 
 Using and loading save states can cause items to be lost forever and/or locations to be checked erroneously and is not recommended. The mod tracks the player's inventory counts and adjusts the save file in real-time. Loading a save state where the player's in-game inventory is different than what is in the Archipelago mod save file will cause undefined behaviour.
+
+[Original APworld](https://github.com/SDMichaud/Archipelago-MGS) - All work was based off this apworld, of which I have no idea how to contact the dev (and it's had an active PR since he first released it basically) 
