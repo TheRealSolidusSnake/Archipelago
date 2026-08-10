@@ -1,0 +1,9 @@
+{
+    "game": "MGS: Masala Garden Salad",
+    "world_version": "1.0.0",
+    "minimum_ap_version": "0.6.7",
+    "authors": [
+        "SDMichaud",
+        "TheRealSolidusSnake"
+    ]
+}
