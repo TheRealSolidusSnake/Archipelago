@@ -42,7 +42,7 @@ The game should continue as normal.
 
 1. Navigate to your BizHawk install directory and launch `EmuHawk.exe` (or `EmuHawkMono.sh` on Linux).
 2. Launch the Lua Console (Tools > Lua Console)
-3. In the Lua Console, open the 'connector_bizhawk_generic.lua' script, located in the 'Lua' folder in your BizHawk install directory. (Script > Open Script...)
+3. In the Lua Console, open the 'connector_bizhawk_generic.lua' script, located inside your Archipelago/data/lua (Script > Open Script...)
 5. In the BizHawk window, open the Metal Gear Solid mutli-disc bundle you created. (File > Open ROM...)
 
 You are now ready to connect to BizHawk to the BizHawk Client.
