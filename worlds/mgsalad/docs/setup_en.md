@@ -3,7 +3,7 @@
 ## Required Software
 
 - [Archipelago](https://github.com/ArchipelagoMW/Archipelago/releases)
-- [BizHawk](https://tasvideos.org/BizHawk/ReleaseHistory) the 2.9.1 version is recommended.
+- [BizHawk](https://tasvideos.org/BizHawk/ReleaseHistory) the 2.9.1 version is recommended but newer versions seem to work just fine.
 - A legally obtained Metal Gear Solid Greatest Hits Version (Disc 1 and Disc 2). The Archipelago community cannot provide this.
 
 ## Generating a Multi-disk Bundle
@@ -43,7 +43,7 @@ The game should continue as normal.
 1. Navigate to your BizHawk install directory and launch `EmuHawk.exe` (or `EmuHawkMono.sh` on Linux).
 2. Launch the Lua Console (Tools > Lua Console)
 3. In the Lua Console, open the 'connector_bizhawk_generic.lua' script, located inside your Archipelago/data/lua (Script > Open Script...)
-5. In the BizHawk window, open the Metal Gear Solid mutli-disc bundle you created. (File > Open ROM...)
+5. In the BizHawk window, open the Metal Gear Solid multi-disc bundle you created. (File > Open ROM...)
 
 You are now ready to connect to BizHawk to the BizHawk Client.
 
@@ -59,10 +59,8 @@ It is normal for the BizHawk Client to state 'No handler was found for this game
 
 ## Saved Games and New Games
 
-When first connecting to an Archipelago server, the Metal Gear Solid Archipelago mod will look for a file named `mgsalad_archipelago_save.json` in the 'mgsalad' folder located in the 'worlds' folder of the Archipelago install directory. If no save file is found, a new one will be created. The player can save their Metal Gear Solid progress by calling Mei Ling and selecting the 'SAVE' option as normal. The player's current progress in Archipelago is saved in real-time as the player checks locations and receives items. The player can disconnect from the Archipelago server and close all open programs after saving.
+When first connecting to an Archipelago server, if no save file is found, a new one will be created. The player can save their progress by calling Mei Ling and selecting the 'SAVE' option as normal. The player's current progress in Archipelago is saved in real-time as the player checks locations and receives items. The player can disconnect from the Archipelago server and close all open programs after saving.
 
-When loading a saved game, launch all programs and connect to the Archipelago server as described above. The BizHawk Client should note that a Metal Gear Solid save file has been loaded and not that a new one has been created. The player can now load their saved game in Metal Gear Solid as normal and find all their items and progress as they left it.
-
-When starting a new run, the old `mgsalad_archipelago_save.json` file should be deleted, moved, or renamed to prevent the Metal Gear Solid Archipelago mod from loading previous save data.
+When loading a saved game, launch all programs and connect to the Archipelago server as described above. The BizHawk Client should note that a Masala Garden Salad save file has been loaded and not that a new one has been created. The player can now load their saved game as normal and find all their items and progress as they left it.
 
 Using and loading save states can cause items to be lost forever and/or locations to be checked erroneously and is not recommended. The mod tracks the player's inventory counts and adjusts the save file in real-time. Loading a save state where the player's in-game inventory is different than what is in the Archipelago mod save file will cause undefined behaviour.
