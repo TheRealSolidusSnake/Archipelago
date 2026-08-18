@@ -4,7 +4,7 @@
 
 - [Archipelago](https://github.com/ArchipelagoMW/Archipelago/releases)
 - [BizHawk](https://tasvideos.org/BizHawk/ReleaseHistory) the 2.9.1 version is recommended.
-- A legally obtained Metal Gear Solid ROM file (Disc 1 and Disc 2). The Archipelago community cannot provide this.
+- A legally obtained Metal Gear Solid Greatest Hits Version (Disc 1 and Disc 2). The Archipelago community cannot provide this.
 
 ## Generating a Multi-disk Bundle
 
