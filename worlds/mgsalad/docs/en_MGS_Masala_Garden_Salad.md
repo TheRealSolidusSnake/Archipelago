@@ -41,7 +41,15 @@ In Metal Gear Solid, certain item pickups will only spawn if the player doesn't 
 
 ## How do I defeat Psycho Mantis?
 
-The controller must be plugged into the second controller port. I honestly cannot figure out how to emulate this with the BizHawk emulator, so I added a command that can be entered into the Archipelago BizHawk Client that will set his health to 0, effectively allowing players to skip this boss fight. While it is possible to get lucky and hit Mantis while using the first controller port, it is very difficult. The player will still need to hit Mantis at least once while he is at 0 HP to trigger the ending cutscene.
+The controller must be plugged into the second controller port. Navigate to the core settings and make sure you've enabled the second port prior to the core actually being loaded into Bizhawk.
+If you don't do this step prior to starting your game, you will have to save your game and reboot core for the changes to take effect.
+
+<img width="788" height="509" alt="image" src="https://github.com/user-attachments/assets/a56f80fa-cd8a-4d75-930f-2ecf0fb8d768" />
+
+<img width="346" height="417" alt="image" src="https://github.com/user-attachments/assets/fb98f665-c07d-4548-82ca-7f0f7d69a539" />
+
+The original dev added a command that can be entered into the Archipelago BizHawk Client that will set his health to 0, effectively allowing players to skip this boss fight (The player will still need to hit Mantis at least once while he is at 0 HP to trigger the ending cutscene). You can also land every 8th bullet on him with Port 1, and if you get a Game Over three times and call the Colonel on your codec; he will tell you to shoot the two draped statues on the sides of the room to break Mantis's concentration which will also allow you to hit him.
+
 
 ## How do I contact Meryl?
 
@@ -52,4 +60,4 @@ Her frequency is located on the back of the CD case.
 The following commands are only available when using the BizHawk Client to play Metal Gear Solid with Archipelago.
 - `/check_goal` Prints the progress towards the world's selected goal.
 - `/check_collection <region>` Prints which items have been collected in the provided region. By default, the region the player is currently in will be used. 'all' can also be used to print every region.
-- `/kill_mantis` A cheat that reduces Psycho Mantis' HP to 0 in case the player has difficulty switching controller ports in the BizHawk emulator.
+- `/kill_mantis` A cheat that reduces Psycho Mantis' HP to 0 in case the player has difficulty switching controller ports in the BizHawk emulator. (Do not use this while HIDEO is on your screen)
