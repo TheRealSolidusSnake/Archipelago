@@ -55,7 +55,7 @@ You are now ready to connect to BizHawk to the BizHawk Client.
 9. The BizHawk Client should now be connected to both BizHawk and the Archipelago server and will prompt to 'Enter slot name:'
 10. Enter the name of your slot in the text box at the bottom of the BizHawk Client and press the enter key (the name was set in the options YAML file).
 
-It is normal for the BizHawk Client to state 'No handler was found for this game.' while BizHawk is first loading the ROM and the 'PS' logo is on screen. It should eventually note 'Running handler for Metal Gear Solid' once the game's data is loaded into memory. If you connect the BizHawk Client to an Archipelago server before connecting it to BizHawk, the BizHawk Client will note 'Awaiting connection to BizHawk before authenticating' and you will only be prompted for the Slot name after BizHawk is setup and connected to the BizHawk Client.
+It is normal for the BizHawk Client to state 'No handler was found for this game.' while BizHawk is first loading the ROM and the 'PS' logo is on screen. It should eventually note 'Running handler for MGS: Masala Garden Salad' once the game's data is loaded into memory. If you connect the BizHawk Client to an Archipelago server before connecting it to BizHawk, the BizHawk Client will note 'Awaiting connection to BizHawk before authenticating' and you will only be prompted for the Slot name after BizHawk is setup and connected to the BizHawk Client.
 
 ## Saved Games and New Games
 
