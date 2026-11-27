@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from Options import Range, Choice, PerGameCommonOptions
+from Options import Range, NamedRange, Choice, Toggle, PerGameCommonOptions
 
 class LogicDifficulty(Choice):
     """Determines which progression items are required by the world's access logic.
@@ -31,6 +31,47 @@ class LogicDifficulty(Choice):
     option_easy = 0
     option_hard = 1
     default = 0
+
+
+class DeathLink(Toggle):
+    """When enabled, dying sends a DeathLink to other linked players.
+    Receiving a DeathLink gives Snake a Time Bomb with one second left.
+
+    Default: Off
+    """
+
+    display_name = 'Death Link'
+    default = 0
+
+class AddTimeBombTraps(Choice):
+    """Adds Time Bomb Traps to the item pool. When received, Snake gets a Time Bomb
+    with a random timer between 5 and 15 seconds.
+
+    Default: Off
+    """
+
+    display_name = 'Add Time Bomb Traps'
+    option_false = 0
+    option_true = 1
+    default = 0
+
+
+class TimeBombTrapCount(NamedRange):
+    """How many Time Bomb Traps should be placed when Add Time Bomb Traps is enabled.
+
+    Default: 10
+    """
+
+    display_name = 'Time Bomb Trap Count'
+    range_start = 0
+    range_end = 30
+    default = 10
+    special_range_names = {
+        'disabled': 0,
+        'half': 15,
+        'all': 30,
+    }
+
 
 class RunGoal(Choice):
     """Choose the victory condition for this world.
@@ -84,6 +125,9 @@ class BossGoal(Range):
 @dataclass
 class MGSOptions(PerGameCommonOptions):
     logic_difficulty: LogicDifficulty
+    death_link: DeathLink
+    add_time_bomb_traps: AddTimeBombTraps
+    time_bomb_trap_count: TimeBombTrapCount
     run_goal: RunGoal
     dogtag_goal: DogtagGoal
     extra_dogtags: ExtraDogtags

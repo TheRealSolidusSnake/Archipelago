@@ -42,6 +42,7 @@ item_names = [
     'PSG-1',
     'Dogtag',
     'Boss Dogtag',
+    'Time Bomb Trap',
     'Victory',
 ]
 

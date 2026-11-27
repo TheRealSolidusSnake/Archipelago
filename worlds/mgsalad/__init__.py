@@ -25,6 +25,12 @@ class MGSWorld(World):
     game = 'MGS: Masala Garden Salad'
     options_dataclass = Options.MGSOptions 
     options: Options.MGSOptions  # type: ignore # typing hints for option results
+    found_entrances_datastorage_key = "MGSALAD_EVENTS_{team}_{player}"
+    boss_event_mask = 0
+
+    def reconnect_found_entrances(self, found_key, data_storage_value):
+        self.boss_event_mask = data_storage_value if isinstance(data_storage_value, int) else 0
+
     topology_present = True  # show path to required location checks in spoiler
     web = MGOnline()
 
@@ -53,6 +59,9 @@ class MGSWorld(World):
         self.dogtag_goal = self.options.dogtag_goal.value
         self.dogtag_extra = self.options.extra_dogtags.value
         self.logic_difficulty = self.options.logic_difficulty.value
+        self.death_link = self.options.death_link.value
+        self.add_time_bomb_traps = self.options.add_time_bomb_traps.value
+        self.time_bomb_trap_count = self.options.time_bomb_trap_count.value
 
     # Helper functions for creating different classes of items
     def create_item(self, name: str) -> Items.MGSItems:
@@ -75,10 +84,10 @@ class MGSWorld(World):
 
         item = Items.MGSItems(name, classificaton, item_id, self.player)
         return item
-    
-    def create_event(self, name: str) -> Items.MGSItems:
-        item_id = None
-        classification = ItemClassification.progression
+
+    def create_item_trap(self, name: str) -> Items.MGSItems:
+        item_id = Items.item_name_to_id_table[name]
+        classification = ItemClassification.trap
 
         item = Items.MGSItems(name, classification, item_id, self.player)
         return item
@@ -127,11 +136,18 @@ class MGSWorld(World):
         self.item_pool.append(self.create_item('PSG-1'))
         self.item_pool.append(self.create_item('PSG-1'))
         self.item_pool.append(self.create_item('Medicine'))
+
+        # Same basic setup as the RE randomizers: traps reserve junk/filler spots
+        # instead of adding extra locations to the world.
+        if self.add_time_bomb_traps:
+            for _ in range(self.time_bomb_trap_count):
+                self.item_pool.append(self.create_item_trap('Time Bomb Trap'))
+
         # Calculate how many more items need to be added to the item_pool
         if self.run_goal == 1: # Boss Blits, remove 14 filler items for Boss Dogtag items created in Rules.py
-            filler_count = len(self.multiworld.get_unfilled_locations(self.player)) - len(self.item_pool) - 15 - 2 # Two events need to be subtracted as well!
+            filler_count = len(self.multiworld.get_unfilled_locations(self.player)) - len(self.item_pool) - 15
         else:
-            filler_count = len(self.multiworld.get_unfilled_locations(self.player)) - len(self.item_pool) - 1 - 2
+            filler_count = len(self.multiworld.get_unfilled_locations(self.player)) - len(self.item_pool) - 1
         # Fill the item pool with additional items, weighted towards SOCOM, FA-MAS, and Rations, then Stinger, PSG-1, and Chaff Grenades, then everything else.
         for _ in range(filler_count):
             match self.random.randint(0, 2):
@@ -173,6 +189,9 @@ class MGSWorld(World):
             'boss_goal': self.options.boss_goal.value,
             'dogtag_goal': self.options.dogtag_goal.value,
             'logic_difficulty': self.options.logic_difficulty.value,
+            'death_link': self.options.death_link.value,
+            'add_time_bomb_traps': self.options.add_time_bomb_traps.value,
+            'time_bomb_trap_count': self.options.time_bomb_trap_count.value,
         }
 
 # def run_client(*args):

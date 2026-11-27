@@ -1,13 +1,14 @@
 import logging
 import json
+import re
 import time
-import hashlib
+import random
 from typing import TYPE_CHECKING, Any
 
 from pathlib import Path
 
 from NetUtils import ClientStatus, NetworkItem
-from Utils import user_path
+from Utils import user_path, async_start
 
 import worlds._bizhawk as bizhawk
 from worlds._bizhawk.client import BizHawkClient
@@ -22,11 +23,16 @@ from . import Regions
 if TYPE_CHECKING:
     from worlds._bizhawk.context import BizHawkClientContext, BizHawkClientCommandProcessor
 
-# TODO MGS: Add support for DeathLink (give the player a Time Bomb with 1 second left)
 # TODO MGS: Make increasing max health a "useful" item
+# TODO MGS: Add room_info to save_state dictionary to allow for multiple runs of the same game. Add a way to delete old saves?
 # TODO MGS: Refactor different sections of game_watcher to their own functions
 
 logger = logging.getLogger('Client')
+
+# Keep AP-owned weapon ammo one below the in-game 1000 cap. That leaves one
+# point of headroom so a physical pickup can still raise RAM and be detected as
+# a location check instead of getting swallowed by the game's max-ammo clamp.
+AP_AMMO_CAP = 999
 
 
 def to_u16_bytes(value: int) -> bytes:
@@ -35,24 +41,6 @@ def to_u16_bytes(value: int) -> bytes:
 	# or else the client will refuse to send/receive anymore
     value = max(0, min(int(value), 0xFFFF))
     return value.to_bytes(length=2, byteorder='little')
-
-def sanitize_save_component(value: object, max_length: int = 80) -> str:
-    """Return a Windows-safe, collision-resistant filename component."""
-    original = str(value)
-    sanitized = ''.join(
-        character if character.isalnum() or character in ('-', '_', '.') else '_'
-        for character in original
-    ).strip(' ._')
-    sanitized = sanitized or 'unknown'
-
-    # If sanitizing changed the seed name, append a short digest so two seed
-    # names which differ only by invalid filename characters cannot collide.
-    if sanitized != original or len(sanitized) > max_length:
-        digest = hashlib.sha256(original.encode('utf-8')).hexdigest()[:8]
-        prefix_length = max(1, max_length - len(digest) - 1)
-        sanitized = f'{sanitized[:prefix_length]}_{digest}'
-
-    return sanitized
 
 def cmd_check_goal(self: "BizHawkClientCommandProcessor") -> None:
     """Check progress towards goal"""
@@ -114,6 +102,28 @@ def cmd_kill_mantis(self: "BizHawkClientCommandProcessor") -> None:
     assert isinstance(client, MetalGearSolidClient)
     client.kill_mantis_command = True
 
+def cmd_pal_key(self: "BizHawkClientCommandProcessor", temperature='') -> None:
+    """Set the PAL Key temperature without doing the temperature-room backtrack. Usage: /pal normal|hot|cold"""
+    from worlds._bizhawk.context import BizHawkClientContext
+    ctx = self.ctx
+    assert isinstance(ctx, BizHawkClientContext)
+    client = ctx.client_handler
+    assert isinstance(client, MetalGearSolidClient)
+
+    temperature = str(temperature).strip().lower()
+    aliases = {
+        'normal': 'normal',
+        'neutral': 'normal',
+        'hot': 'hot',
+        'cold': 'cold',
+    }
+    pal_state = aliases.get(temperature)
+    if pal_state is None:
+        logger.info('[MGS: Masala Garden Salad] Usage: /pal normal|hot|cold')
+        return
+
+    client.pal_key_temperature_command = pal_state
+
 # Single source of truth for "which Key Card level does this cutscene text belong to".
 # Gray Fox happened to want to send Key Card 5 from Nuke Building B1 for some reason. (since we added regions, anyway)
 # So we try to lock the key cards to their appropriate locations.
@@ -127,11 +137,30 @@ KEY_CARD_LEVEL_BY_CUTSCENE_BYTES: dict[bytes, int] = {
     RAM.key_card_level_7_cutscene_bytes: 7,  # shared with 'BOSS: Vulcan Raven'
 }
 
+# PopTracker can follow game-side events through Archipelago DataStorage, the same
+# way the FFV tracker follows things like its piano events. Each boss owns one bit.
+BOSS_EVENT_BITS: dict[str, int] = {
+    'BOSS: Heavily Armed Genome Soldiers': 0,
+    'BOSS: Revolver Ocelot': 1,
+    'BOSS: M1 Tank': 2,
+    'BOSS: Gray Fox': 3,
+    'BOSS: Psycho Mantis': 4,
+    'BOSS: Sniper Wolf I': 5,
+    'BOSS: Black-outfitted Genome Soldiers I': 6,
+    'BOSS: A Hind D?': 7,
+    'BOSS: Stealth Camouflaged Genome Soldiers': 8,
+    'BOSS: Sniper Wolf II': 9,
+    'BOSS: Black-outfitted Genome Soldiers II': 10,
+    'BOSS: Vulcan Raven': 11,
+    'BOSS: Metal Gear REX': 12,
+    'BOSS: Liquid Snake': 13,
+}
+
+# Boss rewards and tracker flags are independent of generation logic.
 class MetalGearSolidClient(BizHawkClient):
     game = "MGS: Masala Garden Salad"
     system = "PSX"
     patch_suffix = ".apmgsalad"
-    build_version = "1.0.0"
 
     # These are physical pickups that disappear if the player already has the item.
     # If AP sends one early, hold it until the matching in-game location has been checked.
@@ -152,27 +181,114 @@ class MetalGearSolidClient(BizHawkClient):
 
     def __init__(self):
         super().__init__()
+        self.death_link_enabled = False
+        self.pending_deathlink = False
+        self.deathlink_death_pending = False
+        self.was_game_over = False
+        self.last_received_deathlink_time: float | None = None
+        self.last_sent_deathlink_time: float | None = None
+        # Tracks only bombs injected by AP. Vanilla/story Time Bombs are deliberately
+        # left alone so the client never mistakes MGS's own bomb for one of ours.
+        self.active_ap_time_bomb_source: str | None = None
+
+    async def display_message(self, ctx: "BizHawkClientContext", message: str) -> None:
+        # Use BizHawk's normal on-screen message queue. This keeps the display
+        # separate from MGS's own HUD/text boxes, so we don't have to poke at
+        # game text RAM just to tell the player what AP is doing.
+        try:
+            await bizhawk.display_message(ctx.bizhawk_ctx, message)
+        except Exception:
+            # It's just a popup. Don't let it take the client down if BizHawk
+            # disconnects right when we're trying to show one.
+            logger.debug(f'[MGS: Masala Garden Salad - DEBUG] Could not display BizHawk message: {message}')
+
+    def queue_display_message(self, ctx: "BizHawkClientContext", message: str) -> None:
+        async_start(self.display_message(ctx, message), name='MGS BizHawk Message')
 
     def on_package(self, ctx: "BizHawkClientContext", cmd: str, args: dict) -> None:
         if cmd == 'Connected':
             self.bizhawk_ctx = ctx
             self.initalize_client()
+            async_start(ctx.update_death_link(self.death_link_enabled), name='MGS DeathLink Update')
+        elif cmd == 'RoomUpdate' and 'checked_locations' in args and hasattr(self, 'save_state'):
+            self.synchronize_region_check_trackers()
+        elif cmd == 'Bounced' and self.death_link_enabled and 'DeathLink' in args.get('tags', []):
+            data = args.get('data', {})
+            death_time = data.get('time')
+
+            if death_time is None:
+                return
+            if death_time == self.last_sent_deathlink_time or death_time == self.last_received_deathlink_time:
+                return
+
+            self.last_received_deathlink_time = death_time
+            self.pending_deathlink = True
+            source = data.get('source', 'another player')
+            self.queue_display_message(ctx, f'DeathLink received from {source}!')
+        elif cmd == 'PrintJSON' and args.get('type') == 'ItemSend':
+            # Received items get their popup when we actually process them below.
+            # Only use ItemSend here for things this slot sent to somebody else,
+            # otherwise local items would get two messages.
+            item = args.get('item')
+            receiving = args.get('receiving')
+            if item is None or receiving is None or ctx.slot is None:
+                return
+
+            if item.player == ctx.slot and receiving != ctx.slot:
+                item_name = ctx.item_names.lookup_in_slot(item.item, receiving)
+                receiver_name = ctx.player_names.get(receiving, f'Player {receiving}')
+                self.queue_display_message(ctx, f'Sent {item_name} to {receiver_name}')
+
+    async def send_death_link(self, ctx: "BizHawkClientContext", cause: str) -> None:
+        # Do the tiny bit of send_death() here so we know the exact timestamp before
+        # yielding to the server. That lets our Bounced handler reliably ignore our
+        # own DeathLink without filtering another client connected to the same slot.
+        if ctx.server is None or ctx.server.socket.closed:
+            return
+
+        death_time = time.time()
+        self.last_sent_deathlink_time = death_time
+        ctx.last_death_link = death_time
+        logger.info('DeathLink: Sending death to your friends...')
+        await ctx.send_msgs([{
+            'cmd': 'Bounce',
+            'tags': ['DeathLink'],
+            'data': {
+                'time': death_time,
+                'source': ctx.player_names.get(ctx.slot, 'Snake'),
+                'cause': cause,
+            },
+        }])
 
     def initalize_client(self):
-        logger.info(f'[MGS: Masala Garden Salad] Client build: {self.build_version}')
         if self.bizhawk_ctx.slot_data:
             self.run_goal = self.bizhawk_ctx.slot_data['run_goal']
             self.boss_goal = self.bizhawk_ctx.slot_data['boss_goal']
             self.dogtag_goal = self.bizhawk_ctx.slot_data['dogtag_goal']
             self.logic_difficulty = self.bizhawk_ctx.slot_data.get('logic_difficulty', 0)
+            self.death_link_enabled = bool(self.bizhawk_ctx.slot_data.get('death_link', False))
         else:
             self.logic_difficulty = 0
+            self.death_link_enabled = False
+        self.pending_deathlink = False
+        self.deathlink_death_pending = False
+        self.was_game_over = False
+        self.last_received_deathlink_time = None
+        self.last_sent_deathlink_time = None
+        self.active_ap_time_bomb_source = None
         self.run_once = True
         self.max_items = 1000
         self.locations_to_send = []
+        # LocationChecks are asynchronous. Keep IDs here after we've sent them until
+        # the server reflects them in checked_locations, otherwise another pickup can
+        # select the same AP location again and still advance the local region count.
+        self.pending_location_checks: set[int] = set()
+        self.boss_event_storage_key: str | None = None
+        self.boss_event_mask_sent = None
         self.received_item_count = 0
         self.location_name_to_server_location_id = {}
         self.kill_mantis_command = False
+        self.pal_key_temperature_command: str | None = None
         self.current_region = ''
         # The identifying cutscene bytes and the scripted Key Card RAM increase
         # do not always appear during the same client poll. Briefly retain each
@@ -181,79 +297,85 @@ class MetalGearSolidClient(BizHawkClient):
         self.recent_key_card_cutscene_time = 0.0
         self.pending_key_card_level: int | None = None
         self.pending_key_card_time = 0.0
-        # The game restores Snake's pre-capture inventory as he leaves the
-        # Medi Room. For a few watcher polls those restored counts can look
-        # like duplicate pickups, even though no world item was collected.
+        # The game gives Snake his old inventory back over a couple watcher polls
+        # after capture. Don't let that look like another Ration pickup.
         self.suppress_post_capture_ration_messages_until = 0.0
-        # A denied pickup can remain visible for a few watcher polls while the
-        # ammo rollback is being written. Throttle identical access warnings so
-        # one attempted pickup produces one useful message instead of log spam.
-        self.blocked_pickup_message_times: dict[tuple[str, str, str], float] = {}
+        # Escape Route doesn't use the normal AP inventory baseline. Track the
+        # game's ration count directly so its one AP ration check can still fire.
+        self.escape_route_rations_last_seen: int | None = None
 
-        # Keep each Archipelago seed and slot in its own client save. This prevents
-        # one run's counters and received-item history from carrying into another
-        # multiworld while still allowing reconnects to resume normally.
-        # BizHawkClientContext stores the RoomInfo seed in server_seed_name.
-        # Older/custom client contexts may expose seed_name instead, so retain that
-        # as a compatibility fallback. Do not use the connection address (such as
-        # localhost), because multiple multiworlds can be hosted at the same address.
+        # Keep every AP run in its own save so counters from one seed/slot
+        # can't leak into another one.
         seed_name = (
             getattr(self.bizhawk_ctx, 'server_seed_name', None)
             or getattr(self.bizhawk_ctx, 'seed_name', None)
             or 'unknown_seed'
         )
-        slot_number = self.bizhawk_ctx.slot if self.bizhawk_ctx.slot is not None else 0
+        slot_number = getattr(self.bizhawk_ctx, 'slot', None)
+        if slot_number is None:
+            slot_number = 0
 
-        # Archipelago's automatically generated seed names commonly begin with
-        # "Archipelago_". The mgsalad prefix already identifies the file, so
-        # omit that redundant prefix from the per-seed filename.
-        filename_seed_name = seed_name
-        if filename_seed_name.casefold().startswith('archipelago_'):
-            filename_seed_name = filename_seed_name[len('Archipelago_'):]
+        seed_name_for_file = str(seed_name)
+        if seed_name_for_file.startswith('Archipelago_'):
+            seed_name_for_file = seed_name_for_file[len('Archipelago_'):]
+        safe_seed_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', seed_name_for_file).strip(' .')
+        if not safe_seed_name:
+            safe_seed_name = 'unknown_seed'
 
-        seed_component = sanitize_save_component(filename_seed_name)
-        self.save_file = Path(user_path(
-            f'mgsalad_{seed_component}_slot{slot_number}.json'
-        ))
+        self.save_file = Path(user_path(f'mgsalad_{safe_seed_name}_slot{slot_number}.json'))
+        legacy_save_files = [
+            Path(user_path('mgs_archipelago_save.json')),
+            Path(user_path('mgsalad_archipelago_save.json')),
+        ]
 
         if self.save_file.exists():
             with open(self.save_file) as save:
                 try:
                     self.save_state: dict[str, Any] = json.load(save)
-                    logger.info(
-                        f'[MGS: Masala Garden Salad] Loaded save for seed "{seed_name}", slot {slot_number}:'
-                    )
+                    logger.info(f'[MGS: Masala Garden Salad] Loaded save for seed {seed_name}, slot {slot_number}:')
                     logger.info(f'[MGS: Masala Garden Salad] {self.save_file}')
                 except json.JSONDecodeError:
-                    logger.info(
-                        f'[MGS: Masala Garden Salad] Save file was unreadable. Creating a fresh save for seed "{seed_name}", slot {slot_number}.'
-                    )
+                    logger.warning('[MGS: Masala Garden Salad] Save file was invalid. Rebuilding it from the connected slot.')
                     self.save_state = self.initalize_save_data()
-                    with open(self.save_file, 'w') as save:
-                        json.dump(self.save_state, save)
         else:
             self.save_state: dict[str, Any] = self.initalize_save_data()
-            logger.info(
-                f'[MGS: Masala Garden Salad] No save found for seed "{seed_name}", slot {slot_number}. Creating a new save:'
-            )
-            logger.info(f'[MGS: Masala Garden Salad] {self.save_file}')
-            with open(self.save_file, 'w') as save:
-                json.dump(self.save_state, save)
+            logger.info(f'[MGS: Masala Garden Salad] No save found for seed {seed_name}, slot {slot_number}. Creating one from the connected slot.')
+            for legacy_save_file in legacy_save_files:
+                if legacy_save_file.exists():
+                    logger.info('[MGS: Masala Garden Salad] Old shared save found and left untouched:')
+                    logger.info(f'[MGS: Masala Garden Salad] {legacy_save_file}')
+
+        self.save_state['archipelago_seed'] = str(seed_name)
+        self.save_state['archipelago_team'] = getattr(self.bizhawk_ctx, 'team', None)
+        self.save_state['archipelago_slot'] = slot_number
+        self.save_state['archipelago_slot_name'] = getattr(self.bizhawk_ctx, 'auth', None)
 
         # The Archipelago Server has an ID for all locations in the multiworld, this creates a dictionary where location names get mapped to their ID on the server
         self.save_state['region_item_location_names'] = self.build_region_item_location_names()
         self.save_state.setdefault('viewed_pal_key_cutscene_text', [])
         self.save_state.setdefault('medi_room_otacon_gifts_received', False)
+        self.save_state.setdefault('pending_time_bomb_traps', [])
+        # Traps use their own receive cursor so they do not have to wait for the
+        # normal inventory receive path before entering the bomb queue. Existing
+        # saves start scanning from whatever the normal item cursor already handled.
+        self.save_state.setdefault(
+            'time_bomb_trap_scan_counter',
+            self.save_state.get('received_item_counter', 0),
+        )
+        self.save_state.setdefault('boss_event_mask', 0)
         self.save_state.setdefault('has_defeated_hind', False)
+        self.save_state.setdefault('has_defeated_rex', False)
         self.save_state.setdefault('has_camera', False)
         self.save_state.setdefault('camera_counter', 0)
         self.save_state.setdefault('camera_location_counter', 1)
         self.save_state.setdefault('camera_max_location_counter', 1)
-        self.save_state.setdefault('endgame_inventory_locked', False)
-        self.save_state.setdefault('endgame_rations_last_seen', None)
-        self.save_state.setdefault('pending_endgame_items', [])
 
-        for server_location in self.bizhawk_ctx.server_locations:
+        # Older builds could save weapon ammo above the 1000 in-game limit (or
+        # even 0xFFFF after a bad death-state restore). Normalize that before the
+        # first RAM restore so reconnecting cannot immediately hide a weapon.
+        self.sanitize_weapon_ammo_counters()
+
+        for server_location in (set(self.bizhawk_ctx.server_locations) | set(self.bizhawk_ctx.checked_locations)):
             self.location_name_to_server_location_id[self.bizhawk_ctx.location_names.lookup_in_game(code=server_location, game_name='MGS: Masala Garden Salad')] = server_location
 
         for full_name, server_location in list(self.location_name_to_server_location_id.items()):
@@ -261,29 +383,122 @@ class MetalGearSolidClient(BizHawkClient):
                 short_name = full_name.rsplit(' - ', 1)[1]
                 self.location_name_to_server_location_id.setdefault(short_name, server_location)
 
-        hind_location_id = self.resolve_location_id('BOSS: A Hind D?')
-        rex_location_id = self.resolve_location_id('BOSS: Metal Gear REX')
-        checked_locations = getattr(self.bizhawk_ctx, 'checked_locations', set())
-        if hind_location_id is not None and hind_location_id in checked_locations:
-            self.save_state['has_defeated_hind'] = True
-        if rex_location_id is not None and rex_location_id in checked_locations:
-            self.save_state['endgame_inventory_locked'] = True
+        # Checked locations can come from !collect, not from actual boss defeats.
+        # Rebuild old saved masks using only recorded in-game encounters.
+        self.save_state['boss_event_mask'] = self.get_recorded_boss_event_mask()
+        self.save_state['has_defeated_hind'] = bool(self.save_state['boss_event_mask'] & (1 << BOSS_EVENT_BITS['BOSS: A Hind D?']))
+        self.save_state['has_defeated_rex'] = bool(self.save_state['boss_event_mask'] & (1 << BOSS_EVENT_BITS['BOSS: Metal Gear REX']))
 
-        # Keep the per-region counters and maximums aligned with the actual
-        # regional AP location names. This also migrates older save files whose
-        # Comm Tower B counters combined the pre-Hind and post-Hind areas.
+        # Rebuild counters from the slot's actual checked locations. A brand-new
+        # per-slot save therefore starts from the server state instead of pretending
+        # every location is unchecked.
         self.synchronize_region_check_trackers()
 
-    def has_received_ap_item(self, item_name: str) -> bool:
-        """Return whether Archipelago has ever sent this item to the player."""
-        for network_item in self.bizhawk_ctx.items_received:
-            received_name = self.bizhawk_ctx.item_names.lookup_in_game(
-                code=network_item.item,
-                game_name='MGS: Masala Garden Salad',
-            )
-            if received_name == item_name:
-                return True
-        return False
+        with open(self.save_file, 'w') as save:
+            json.dump(self.save_state, save)
+
+    def sanitize_weapon_ammo_counters(self) -> bool:
+        changed = False
+        weapon_counters = (
+            ('SOCOM', 'has_socom', 'socom_counter'),
+            ('FA-MAS', 'has_famas', 'famas_counter'),
+            ('Grenade', 'has_grenade', 'grenade_counter'),
+            ('Nikita', 'has_nikita', 'nikita_counter'),
+            ('Stinger', 'has_stinger', 'stinger_counter'),
+            ('Claymore', 'has_claymore', 'claymore_counter'),
+            ('C4', 'has_c4', 'c4_counter'),
+            ('Stun Grenade', 'has_stun_grenade', 'stun_grenade_counter'),
+            ('Chaff Grenade', 'has_chaff_grenade', 'chaff_grenade_counter'),
+            ('PSG-1', 'has_psg1', 'psg1_counter'),
+        )
+
+        for weapon_name, has_key, counter_key in weapon_counters:
+            old_value = int(self.save_state.get(counter_key, 0))
+            if not self.save_state.get(has_key, False):
+                # If an unowned weapon picked up a poisoned oversized value in an older
+                # save, clear that value instead of letting it become real ammo later.
+                new_value = 0 if old_value > AP_AMMO_CAP else max(0, old_value)
+            else:
+                new_value = max(0, min(old_value, AP_AMMO_CAP))
+
+            if new_value != old_value:
+                self.save_state[counter_key] = new_value
+                changed = True
+
+        return changed
+
+    def restore_weapon_ammo_from_death(
+        self,
+        weapon_name: str,
+        has_key: str,
+        counter_key: str,
+        death_value: int,
+        live_address: int,
+        death_address: int,
+        write_list: list,
+    ) -> bool:
+        if not self.save_state.get(has_key, False):
+            return False
+
+        saved_value = max(0, min(int(self.save_state.get(counter_key, 0)), AP_AMMO_CAP))
+        if death_value == 0xFFFF:
+            # 0xFFFF means the weapon/item is disabled. Never copy that sentinel
+            # into an AP-owned weapon just because the game's death backup is bad.
+            safe_value = saved_value
+        else:
+            safe_value = max(0, min(int(death_value), AP_AMMO_CAP))
+
+        self.save_state[counter_key] = safe_value
+        # Repair both copies. The game uses the death backup when it restores the
+        # player, so leaving a bad 0xFFFF/over-cap value there can make the problem
+        # come right back after Continue.
+        write_list.append((live_address, to_u16_bytes(safe_value), 'MainRAM'))
+        write_list.append((death_address, to_u16_bytes(safe_value), 'MainRAM'))
+        return True
+
+
+    def get_recorded_boss_event_mask(self) -> int:
+        mask = 0
+        viewed = self.save_state['viewed_boss_cutscene_bytes']
+        for cutscene_bytes, location_name in RAM.boss_cutscene_bytes_to_location_list.items():
+            bit = BOSS_EVENT_BITS.get(location_name)
+            if bit is not None and cutscene_bytes.decode(errors='ignore') in viewed:
+                mask |= 1 << bit
+        if self.save_state.get('has_snowfield', False):
+            mask |= 1 << BOSS_EVENT_BITS['BOSS: Stealth Camouflaged Genome Soldiers']
+        return mask
+
+    def record_boss_event(self, location_name: str) -> None:
+        bit = BOSS_EVENT_BITS.get(location_name)
+        if bit is not None:
+            self.save_state['boss_event_mask'] |= 1 << bit
+
+    async def sync_boss_event_storage(self, ctx: "BizHawkClientContext") -> None:
+        if ctx.team is None or ctx.slot is None or ctx.server is None or ctx.server.socket.closed:
+            return
+
+        storage_key = f'MGSALAD_EVENTS_{ctx.team}_{ctx.slot}'
+        if self.boss_event_storage_key != storage_key:
+            self.boss_event_storage_key = storage_key
+            self.boss_event_mask_sent = None
+
+        # Publish only in-game defeats. Replace also clears false bits sent by
+        # older clients that inferred defeats from server-checked locations.
+        event_mask = self.save_state['boss_event_mask']
+        if event_mask == self.boss_event_mask_sent:
+            return
+
+        await ctx.send_msgs([{
+            'cmd': 'Set',
+            'key': storage_key,
+            'default': 0,
+            'want_reply': False,
+            'operations': [{
+                'operation': 'replace',
+                'value': event_mask,
+            }],
+        }])
+        self.boss_event_mask_sent = event_mask
 
     def resolve_location_id(self, location_name: str) -> int | None:
         # Direct lookup first. 
@@ -296,10 +511,6 @@ class MetalGearSolidClient(BizHawkClient):
         location_aliases = {
             'BOSS: Metal Gear REX': 'Metal Gear REX - BOSS: Metal Gear REX',
             'BOSS: Liquid Snake': 'Metal Gear REX - BOSS: Liquid Snake',
-
-            # Compatibility for seeds/clients created while the restored Armory
-            # C4 room was represented as one region. The current layout splits
-            # the Level 1 C4 and Level 2 FA-MAS checks into their actual doors.
         }
 
         alias_name = location_aliases.get(location_name)
@@ -332,10 +543,59 @@ class MetalGearSolidClient(BizHawkClient):
         if location_id is None:
             return False
 
-        if location_id not in self.locations_to_send:
+        checked_locations = getattr(self.bizhawk_ctx, 'checked_locations', set())
+        self.pending_location_checks.difference_update(checked_locations)
+
+        if (
+            location_id not in checked_locations
+            and location_id not in self.pending_location_checks
+            and location_id not in self.locations_to_send
+        ):
             self.locations_to_send.append(location_id)
 
         return True
+
+    async def flush_location_checks(self, ctx: "BizHawkClientContext") -> None:
+        if not self.locations_to_send:
+            return
+
+        # De-dupe the packet while preserving order. Keep sent IDs locally until
+        # the server acknowledges them; otherwise the next pickup can select the
+        # same AP location again while checked_locations is still catching up.
+        locations = list(dict.fromkeys(self.locations_to_send))
+        await ctx.check_locations(locations)
+        self.pending_location_checks.update(locations)
+        self.locations_to_send.clear()
+
+    def queue_new_time_bomb_traps(self, ctx: "BizHawkClientContext") -> bool:
+        """Pull new Time Bomb Traps out of the AP receive stream immediately.
+
+        Normal received items are applied later in the watcher after the trap-arm
+        check. Giving traps their own cursor lets a newly received trap enter its
+        queue before that check instead of always waiting for another watcher pass.
+        """
+        received_count = len(ctx.items_received)
+        scan_counter = int(self.save_state.get(
+            'time_bomb_trap_scan_counter',
+            self.save_state.get('received_item_counter', 0),
+        ))
+
+        # Be defensive if a server reconnect ever presents a shorter list.
+        scan_counter = max(0, min(scan_counter, received_count))
+        trap_queue = self.save_state.setdefault('pending_time_bomb_traps', [])
+        found_trap = False
+
+        for i in range(scan_counter, received_count):
+            item = ctx.items_received[i]
+            local_item_name = ctx.item_names.lookup_in_game(
+                code=item.item, game_name='MGS: Masala Garden Salad'
+            )
+            if local_item_name == 'Time Bomb Trap':
+                trap_queue.append(random.randint(5, 15))
+                found_trap = True
+
+        self.save_state['time_bomb_trap_scan_counter'] = received_count
+        return found_trap
 
     async def check_received_victory(self, ctx: "BizHawkClientContext") -> None:
         """Report Game Completion as soon as the server sends the Victory item.
@@ -484,13 +744,15 @@ class MetalGearSolidClient(BizHawkClient):
             },
             'cell': {
                 'rations': 0,
-                'rations_max': 2,
+                'rations_max': 4,
                 'socom': 0,
-                'socom_max': 4,
+                'socom_max': 6,
             },
             'armory': {
                 'socom': 0,
                 'socom_max': 2,
+                'c4': 0,
+                'c4_max': 2,
                 'grenade': 0,
                 'grenade_max': 2,
                 'famas': 0,
@@ -498,7 +760,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'nikita': 0,
                 'nikita_max': 2,
                 'psg1': 0,
-                'psg1_max': 3,
+                'psg1_max': 3
             },
             'armory sth': {
                 'rations': 0,
@@ -524,7 +786,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'chaff_grenade': 0,
                 'chaff_grenade_max': 1,
                 'claymore': 0,
-                'claymore_max': 5,
+                'claymore_max': 3,
             },
             'nuke bldg 1': {
                 'rations': 0,
@@ -544,7 +806,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'socom': 0,
                 'socom_max': 2,
                 'famas': 0,
-                'famas_max': 4,
+                'famas_max': 5,
                 'nikita': 0,
                 'nikita_max': 3,
                 'stun_grenade': 0,
@@ -575,12 +837,6 @@ class MetalGearSolidClient(BizHawkClient):
                 'night_vision_goggles_max': 1,
                 'gasmask': 0,
                 'gasmask_max': 1,
-                # Body Armor AP location is generated in Blast Furnace, but the
-                # vanilla Nuke Bldg B2 pickup can still exist. Allow either
-                # physical pickup to send the single Body Armor location
-				# since if you have don't have thermals they don't appear in Nuke B2
-                'body_armor': 0,
-                'body_armor_max': 1,
             },
             'lab': {
                 'rations': 0,
@@ -679,7 +935,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'socom': 0,
                 'socom_max': 2,
                 'famas': 0,
-                'famas_max': 9,
+                'famas_max': 6,
                 'chaff_grenade': 0,
                 'chaff_grenade_max': 1,
                 'psg1': 0,
@@ -721,7 +977,6 @@ class MetalGearSolidClient(BizHawkClient):
                 'famas_max': 1,
                 'c4': 0,
                 'c4_max': 1,
-                # The alternate Body Armor pickup in Nuke B2 lvl 6 can still satisfy the check.
                 'body_armor': 0,
                 'body_armor_max': 1,
                 'stinger': 0,
@@ -737,11 +992,15 @@ class MetalGearSolidClient(BizHawkClient):
             },
             'cargo elev.': {
                 'rations': 0,
-                'rations_max': 1,
+                'rations_max': 2,
                 'famas': 0,
-                'famas_max': 9,
+                'famas_max': 6,
                 'socom': 0,
                 'socom_max': 3,
+                'nikita': 0,
+                'nikita_max': 2,
+                'c4': 0,
+                'c4_max': 1,
                 'claymore': 0,
                 'claymore_max': 5,
             },
@@ -769,7 +1028,7 @@ class MetalGearSolidClient(BizHawkClient):
                 'socom': 0,
                 'socom_max': 3,
                 'famas': 0,
-                'famas_max': 4,
+                'famas_max': 5,
                 'chaff_grenade': 0,
                 'chaff_grenade_max': 3,
                 'stinger': 0,
@@ -891,18 +1150,22 @@ class MetalGearSolidClient(BizHawkClient):
         defaults = self.build_checks_per_region()
         saved_trackers = self.save_state.setdefault('checks_per_region_tracker', {})
         checked_locations = getattr(self.bizhawk_ctx, 'checked_locations', None)
+        if checked_locations is not None:
+            self.pending_location_checks.difference_update(checked_locations)
+            checked_locations = set(checked_locations) | self.pending_location_checks | set(self.locations_to_send)
         total_locations_by_item: dict[str, int] = {}
         checked_locations_by_item: dict[str, int] = {}
 
         for region_name, default_tracker in defaults.items():
-            saved_tracker = saved_trackers.setdefault(region_name, {})
+            # Rebuild the shape from the current region table so an older save cannot
+            # leave stale pickup types behind after a region gets split/changed.
+            old_tracker = saved_trackers.get(region_name, {})
+            saved_tracker = {
+                tracker_key: old_tracker.get(tracker_key, default_value)
+                for tracker_key, default_value in default_tracker.items()
+            }
+            saved_trackers[region_name] = saved_tracker
 
-            for tracker_key, default_value in default_tracker.items():
-                saved_tracker.setdefault(tracker_key, default_value)
-
-            # Numbered pickup locations are the authoritative source for these
-            # maximums. Deriving the values here prevents the client tracker from
-            # drifting when regional location names are added, removed, or split.
             item_locations = self.save_state['region_item_location_names'].get(region_name, {})
             for item_key, location_names in item_locations.items():
                 saved_tracker[f'{item_key}_max'] = len(location_names)
@@ -919,144 +1182,147 @@ class MetalGearSolidClient(BizHawkClient):
                 else:
                     saved_tracker[item_key] = min(saved_tracker.get(item_key, 0), len(location_names))
 
-        # The old global counters are still used as an additional safety gate.
-        # Keep those totals aligned with the same regional location source too.
         for item_key, total_locations in total_locations_by_item.items():
             self.save_state[f'{item_key}_max_location_counter'] = total_locations
             if checked_locations is not None:
                 self.save_state[f'{item_key}_location_counter'] = checked_locations_by_item.get(item_key, 0) + 1
 
-        # Body Armor has one AP location in Blast Furnace, but either the Blast
-        # Furnace pickup or the alternate Nuke Bldg B2 pickup may satisfy it.
-        # Mirror the server-checked state into both physical-region trackers
-        # without counting the single AP location twice in the global maximum.
-        if checked_locations is not None:
-            body_armor_location_id = self.resolve_location_id('Body Armor')
-            body_armor_checked = (
-                body_armor_location_id is not None
-                and body_armor_location_id in checked_locations
-            )
-            for region_name in ('blast furnac', 'nuke bldg b2'):
-                region_tracker = saved_trackers.get(region_name)
-                if region_tracker is not None and 'body_armor' in region_tracker:
-                    region_tracker['body_armor_max'] = 1
-                    region_tracker['body_armor'] = int(body_armor_checked)
-            self.save_state['body_armor_max_location_counter'] = 1
-            self.save_state['body_armor_location_counter'] = 2 if body_armor_checked else 1
+        for stale_region in set(saved_trackers) - set(defaults):
+            del saved_trackers[stale_region]
 
         self.save_state['regions'] = list(defaults.keys())
 
-    def log_blocked_pickup_message(self, region_name: str, item_key: str, message: str) -> None:
-        message_key = (region_name, item_key, message)
-        now = time.monotonic()
-        last_message_time = self.blocked_pickup_message_times.get(message_key, 0.0)
-        if now - last_message_time < 2.0:
-            return
-        self.blocked_pickup_message_times[message_key] = now
-        logger.info(f'[MGS: Masala Garden Salad] {message}')
+    def location_is_in_logic_for_pickup(self, full_location_name: str) -> bool:
+        # Some locked subrooms all report the same RAM region. This stops reloading
+        # an earlier pickup from walking into checks Snake cannot actually reach yet.
+        required_key_card = 0
+        requires_armory_wall = False
+        requires_mine_detector = False
+
+        if full_location_name in ('Cell - SOCOM 5', 'Cell - SOCOM 6'):
+            required_key_card = 1
+        elif full_location_name.startswith('Armory_lvl5 - '):
+            required_key_card = 5
+            requires_mine_detector = True
+        elif full_location_name.startswith('Armory Sth_C4_lvl4 - '):
+            required_key_card = 4
+            requires_armory_wall = True
+        elif full_location_name.startswith('Armory Sth_C4_lvl6 - '):
+            required_key_card = 6
+            requires_armory_wall = True
+        elif full_location_name.startswith('Armory Sth_C4 - '):
+            requires_armory_wall = True
+        elif full_location_name.startswith('Nuke Building B1 lvl4 - '):
+            required_key_card = 4
+        elif full_location_name.startswith('Nuke Building B1 lvl5 - '):
+            required_key_card = 5
+
+        if self.save_state.get('key_card_counter', 0) < required_key_card:
+            return False
+        if requires_mine_detector and not self.save_state.get('has_mine_detector', False):
+            return False
+        if requires_armory_wall:
+            has_c4 = self.save_state.get('has_c4', False)
+            has_stinger = self.save_state.get('has_stinger', False)
+            if self.logic_difficulty == 0:
+                if not (has_c4 or has_stinger):
+                    return False
+            elif not has_c4:
+                return False
+        return True
 
     def get_next_region_location_name(self, region_name: str, item_key: str) -> str | None:
-        region_checks = self.save_state['checks_per_region_tracker'][region_name]
         region_item_locations = self.save_state['region_item_location_names'].get(region_name, {})
-        all_item_locations = list(region_item_locations.get(item_key, []))
-        item_locations = all_item_locations
-        item_index = region_checks.get(item_key, 0)
-        blocked_message: str | None = None
-        item_display_names = {
-            'rations': 'Ration',
-            'medicine': 'Medicine',
-            'diazepam': 'Diazepam',
-            'socom': 'SOCOM',
-            'famas': 'FA-MAS',
-            'grenade': 'Grenade',
-            'nikita': 'Nikita',
-            'stinger': 'Stinger',
-            'claymore': 'Claymore',
-            'c4': 'C4',
-            'stun_grenade': 'Stun Grenade',
-            'chaff_grenade': 'Chaff Grenade',
-            'psg1': 'PSG-1',
-            'camera': 'Camera',
-        }
-        item_display_name = item_display_names.get(item_key, item_key.replace('_', ' ').title())
+        item_locations = region_item_locations.get(item_key, [])
+        checked_locations = getattr(self.bizhawk_ctx, 'checked_locations', set())
+        self.pending_location_checks.difference_update(checked_locations)
 
-        # Every main Armory key-card room is reported under the same RAM
-        # region name. Filter by the AP-controlled Progressive Key Card level
-        # so reloading an accessible pickup cannot consume checks behind a
-        # higher-level door. The deleted main Armory C4-wall rooms are not
-        # part of this list; only the normal Level 1, 2, 3, and 5 rooms remain.
-        if region_name == 'armory':
-            key_card_level = max(0, min(int(self.save_state.get('key_card_counter', 0)), 7))
-            armory_key_card_requirements = {
-                'Armory_lvl1': 1,
-                'Armory_lvl2': 2,
-                'Armory_lvl3': 3,
-                'Armory_lvl5': 5,
-            }
-            item_locations = [
-                location_name
-                for location_name in all_item_locations
-                if key_card_level >= armory_key_card_requirements.get(
-                    location_name.rsplit(' - ', 1)[0],
-                    0,
-                )
-            ]
+        for location_name in item_locations:
+            location_id = self.location_name_to_server_location_id.get(location_name)
+            if location_id is None:
+                continue
+            if (
+                location_id in checked_locations
+                or location_id in self.pending_location_checks
+                or location_id in self.locations_to_send
+            ):
+                continue
+            if not self.location_is_in_logic_for_pickup(location_name):
+                continue
+            return location_name
 
-            if item_index >= len(item_locations) and item_index < len(all_item_locations):
-                blocked_location = all_item_locations[item_index]
-                blocked_region = blocked_location.rsplit(' - ', 1)[0]
-                required_key_card_level = armory_key_card_requirements.get(blocked_region, 0)
-                if key_card_level < required_key_card_level:
-                    blocked_message = (
-                        f'No {item_display_name} check sent: the next Armory '
-                        f'{item_display_name} check requires Progressive Key Card '
-                        f'Level {required_key_card_level}. No location was consumed.'
-                    )
-
-        # Metal Gear Solid reports the base room, C4 room, Level 4 room, and
-        # Level 6 room in Armory South under the same RAM region name. Entry to
-        # Armory South is already gated by C4/Stinger logic, so the client only
-        # needs to separate the Key Card 4 and Key Card 6 pickup tiers. Without
-        # this filter, repeatedly reloading the Level 4 Stinger could consume
-        # the later Level 6 Stinger checks. The C4 room itself has no Key Card
-        # requirement.
-        if region_name == 'armory sth':
-            key_card_level = max(0, min(int(self.save_state.get('key_card_counter', 0)), 7))
-            armory_south_key_card_requirements = {
-                'Armory Sth_C4_lvl4': 4,
-                'Armory Sth_C4_lvl6': 6,
-            }
-            item_locations = [
-                location_name
-                for location_name in all_item_locations
-                if key_card_level >= armory_south_key_card_requirements.get(
-                    location_name.rsplit(' - ', 1)[0],
-                    0,
-                )
-            ]
-
-            if item_index >= len(item_locations) and item_index < len(all_item_locations):
-                blocked_location = all_item_locations[item_index]
-                blocked_region = blocked_location.rsplit(' - ', 1)[0]
-                required_key_card_level = armory_south_key_card_requirements.get(blocked_region, 0)
-                if key_card_level < required_key_card_level:
-                    blocked_message = (
-                        f'No {item_display_name} check sent: the next Armory South '
-                        f'{item_display_name} check requires Progressive Key Card '
-                        f'Level {required_key_card_level}. No location was consumed.'
-                    )
-
-        if item_index < len(item_locations):
-            return item_locations[item_index]
-        if blocked_message is not None:
-            self.log_blocked_pickup_message(region_name, item_key, blocked_message)
         return None
+
+    def queue_key_card_cutscene_location(self, level: int, cutscene_text: str) -> bool:
+        location_name = f'Key Card Level {level}'
+        location_id = self.resolve_location_id(location_name)
+        if location_id is None:
+            return False
+
+        checked_locations = getattr(self.bizhawk_ctx, 'checked_locations', set())
+        was_checked = location_id in checked_locations
+        if not was_checked:
+            self.queue_location(location_name)
+
+        self.save_state['key_card_location_counter'] = max(
+            self.save_state.get('key_card_location_counter', 1),
+            level + 1,
+        )
+        viewed = self.save_state.setdefault('viewed_key_card_cutscene_text', [])
+        if cutscene_text and cutscene_text not in viewed:
+            viewed.append(cutscene_text)
+
+        # Return true if there was anything worth persisting/sending. Reconnecting
+        # to a slot where the cutscene was seen but AP never got the check will
+        # therefore queue it again instead of trusting the local JSON blindly.
+        return not was_checked
+
+    def queue_meryl_key_card_from_pal_event(self) -> bool:
+        # Meryl's scripted PAL Key and Level 5 Key Card belong to the same story
+        # reward. The PAL Key RAM change is much easier to catch than the exact
+        # cutscene text, so treat a checked/pending PAL Key location as durable
+        # proof that Card 5 should also have been sent. This also repairs old
+        # sessions where PAL made it to the server but Card 5 did not.
+        pal_key_location_id = self.resolve_location_id('Pal Key')
+        key_card_location_id = self.resolve_location_id('Key Card Level 5')
+        if pal_key_location_id is None or key_card_location_id is None:
+            return False
+
+        checked_locations = getattr(self.bizhawk_ctx, 'checked_locations', set())
+        self.pending_location_checks.difference_update(checked_locations)
+
+        pal_event_seen = (
+            pal_key_location_id in checked_locations
+            or pal_key_location_id in self.pending_location_checks
+            or pal_key_location_id in self.locations_to_send
+        )
+        key_card_already_handled = (
+            key_card_location_id in checked_locations
+            or key_card_location_id in self.pending_location_checks
+            or key_card_location_id in self.locations_to_send
+        )
+
+        if not pal_event_seen or key_card_already_handled:
+            return False
+
+        self.locations_to_send.append(key_card_location_id)
+        self.save_state['key_card_location_counter'] = max(
+            self.save_state.get('key_card_location_counter', 1),
+            6,
+        )
+        logger.info(
+            '[MGS: Masala Garden Salad] Meryl PAL Key event confirmed; '
+            'queuing Key Card Level 5 as part of the same scripted reward.'
+        )
+        return True
 
     # Various game states are placed into a dictionary and saved as a json file so that runs can be saved and reloaded.
     def initalize_save_data(self):
         save_state : dict[str, Any] = {
             'received_item_counter': 0,
+            'time_bomb_trap_scan_counter': 0,
             'pending_missable_items': [],
+            'pending_time_bomb_traps': [],
             'has_cbox_a': False,
             'cbox_a_counter': 0,
             'has_cbox_b': False,
@@ -1127,7 +1393,7 @@ class MetalGearSolidClient(BizHawkClient):
             'camera_location_counter': 1,
             'camera_max_location_counter': 1,
             'rations_location_counter': 1,
-            'rations_max_location_counter': 46,
+            'rations_max_location_counter': 49,
             'medicine_location_counter': 1,
             'medicine_max_location_counter': 1,
             'diazepam_location_counter': 1,
@@ -1149,30 +1415,27 @@ class MetalGearSolidClient(BizHawkClient):
             'socom_location_counter': 1,
             'socom_max_location_counter': 43,
             'famas_location_counter': 1,
-            'famas_max_location_counter': 58,
+            'famas_max_location_counter': 51,
             'grenade_location_counter': 1,
             'grenade_max_location_counter': 11,
             'nikita_location_counter': 1,
-            'nikita_max_location_counter': 15,
+            'nikita_max_location_counter': 17,
             'stinger_location_counter': 1,
             'stinger_max_location_counter': 26,
             'claymore_location_counter': 1,
-            'claymore_max_location_counter': 15,
+            'claymore_max_location_counter': 13,
             'c4_location_counter': 1,
-            'c4_max_location_counter': 4,
+            'c4_max_location_counter': 7,
             'stun_grenade_location_counter': 1,
-            'stun_grenade_max_location_counter': 11,
+            'stun_grenade_max_location_counter': 10,
             'chaff_grenade_location_counter': 1,
-            'chaff_grenade_max_location_counter': 18,
+            'chaff_grenade_max_location_counter': 17,
             'psg1_location_counter': 1,
             'psg1_max_location_counter': 19,
             'viewed_boss_cutscene_bytes': [],
             'viewed_key_card_cutscene_text': [],
             'viewed_pal_key_cutscene_text': [],
             'is_captured': False,
-            'endgame_inventory_locked': False,
-            'endgame_rations_last_seen': None,
-            'pending_endgame_items': [],
             'has_snowfield': False,
             'has_defeated_hind': False,
             'checks_per_region_tracker': self.build_checks_per_region(),
@@ -1182,82 +1445,50 @@ class MetalGearSolidClient(BizHawkClient):
         save_state['regions'] = [key for key in save_state['checks_per_region_tracker'].keys()]
         return save_state
     
+    def handle_escape_route_pickups(self, read_values: dict, write_list: list) -> bool:
+        """Send the one Escape Route ration check without eating the escape rations.
+
+        MGS gives the player three physical rations during the escape, but AP only
+        owns one location there. Normal AP inventory is intentionally locked for
+        this sequence, so do not compare against or write back the saved AP ration
+        count. The first time we actually see a ration in Snake's escape inventory,
+        send the one check and leave all three physical rations alone.
+        """
+        current_rations = read_values['rations_held']
+
+        if current_rations == 0xFFFF:
+            self.escape_route_rations_last_seen = None
+            return False
+
+        self.escape_route_rations_last_seen = current_rations
+
+        region_checks = self.save_state['checks_per_region_tracker']['esc route']
+        # Snake starts the escape with no usable AP inventory. Waiting for a
+        # previous-frame baseline can miss the first ration if it is collected
+        # between region detection and the next watcher poll, so presence itself
+        # is enough here. Once the single AP check is sent, later rations are
+        # intentionally ignored and remain available for the escape.
+        if current_rations <= 0:
+            return False
+
+        location_name = self.get_next_region_location_name('esc route', 'rations')
+        if location_name is None:
+            return False
+
+        if not self.queue_location(location_name):
+            return False
+
+        if self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter']:
+            self.save_state['rations_location_counter'] += 1
+        region_checks['rations'] += 1
+        return True
+
     # Works by comparing the in-game item counters to counts tracked by the Archipelago client.
     # Ex. Assume the in-game counts are Rations: 0, SOCOM: 0 and the Client counts are the same.
     # The player picks up a ration. The in-game count is now Rations: 1, SOCOM: 0. The Client count is still Rations: 0, SOCOM: 0.
     # The client will detect that the Rations count is higher than it should be and send out a Rations location check to the Archipelago server.
     # It will then decrease the in-game Rations count to 0.
     # Items that can be received during cutscenes work differently!
-    def handle_endgame_pickups(self, read_values: dict, write_list: list) -> bool:
-        """Allow only the physical Escape Route Ration after REX.
-
-        Liquid removes Snake's inventory after the REX battle. During the
-        remaining Liquid/escape sequence, ordinary pickup reconciliation would
-        either restore that removed gear or interpret the removal as item loss.
-        Keep all normal pickup handling disabled, but preserve the one intended
-        physical pickup in the Escape Route.
-        """
-        has_state_changed = False
-        current_rations = read_values['rations_held']
-        previous_rations = self.save_state.get('endgame_rations_last_seen')
-
-        def normalized_ration_count(value: int | None) -> int:
-            if value is None or value == 0xFFFF:
-                return -1
-            return value
-
-        current_normalized = normalized_ration_count(current_rations)
-        previous_normalized = normalized_ration_count(previous_rations)
-
-        if read_values['current_region_name'] == 'esc route':
-            region_checks = self.save_state['checks_per_region_tracker'].get('esc route', {})
-            ration_unsent = (
-                'rations' in region_checks
-                and region_checks['rations'] < region_checks['rations_max']
-            )
-
-            # During continuous play, detect the increase from no ration to one
-            # ration. If reconnecting after the physical pickup but before its
-            # check was sent, a positive first observed value is also sufficient
-            # because Liquid leaves Snake with no inventory.
-            ration_was_picked_up = (
-                previous_rations is not None
-                and current_normalized > previous_normalized
-            )
-            reconnect_after_pickup = (
-                previous_rations is None
-                and current_normalized > 0
-            )
-
-            if ration_unsent and (ration_was_picked_up or reconnect_after_pickup):
-                location_name = self.get_next_region_location_name('esc route', 'rations')
-                if location_name is not None and self.queue_location(location_name):
-                    if self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter']:
-                        self.save_state['rations_location_counter'] += 1
-                    region_checks['rations'] += 1
-
-                    # Keep the vanilla Ration in Snake's inventory and copy it
-                    # to the game's retry/death inventory. Do not merge it into
-                    # the pre-REX AP ration total, which remains intentionally
-                    # inaccessible for the rest of the run.
-                    if current_rations != 0xFFFF:
-                        write_list.append((
-                            RAM.rations_death_count_address,
-                            to_u16_bytes(current_rations),
-                            'MainRAM',
-                        ))
-                    logger.info(
-                        '[MGS: Masala Garden Salad] Escape Route Ration collected; '
-                        'the physical Ration remains available during the endgame lock.'
-                    )
-                    has_state_changed = True
-
-        if previous_rations != current_rations:
-            self.save_state['endgame_rations_last_seen'] = current_rations
-            has_state_changed = True
-
-        return has_state_changed
-
     def handle_item_pickups(self, read_values: dict, write_list: list) -> bool:
         has_state_changed = False
         # Don't check for item pickups during scene when locked up.
@@ -1266,8 +1497,6 @@ class MetalGearSolidClient(BizHawkClient):
         # Ex. SOCOM ammo count of 0x001B becomes 0x801B
         if self.save_state['is_captured']:
             return has_state_changed
-        if self.save_state.get('endgame_inventory_locked', False):
-            return self.handle_endgame_pickups(read_values, write_list)
         
         # A value of 0x0000 means the player has it in inventory with 0 ammo
         # A value of 0xFFFF means the player hasn't been picked up the item yet
@@ -1407,11 +1636,7 @@ class MetalGearSolidClient(BizHawkClient):
                     region_checks['body_armor'] += 1
                     has_state_changed = True
                 else:
-                    # Body Armor is a single AP location with two possible
-                    # physical pickups. A duplicate/stale pickup needs only to
-                    # be reverted; do not emit a misleading "0 of 1" warning.
-                    region_checks['body_armor'] = region_checks['body_armor_max']
-                    has_state_changed = True
+                    logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['body_armor']} of {region_checks['body_armor_max']} Body Armor in {read_values['current_region_name']}!")
             else:
                 logger.info(f"[MGS: Masala Garden Salad] Body Armor not found in: {read_values['current_region_name']}")
 
@@ -1424,17 +1649,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.camera_count_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'camera' in region_checks:
-                if (region_checks['camera'] < region_checks['camera_max']
-                        and self.save_state['camera_location_counter'] <= self.save_state['camera_max_location_counter']):
-                    location_name = self.get_next_region_location_name(
-                        read_values['current_region_name'], 'camera'
-                    )
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['camera_location_counter'] += 1
-                        region_checks['camera'] += 1
-                        has_state_changed = True
-                else:
-                    logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['camera']} of {region_checks['camera_max']} Camera in {read_values['current_region_name']}!")
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'camera')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['camera_location_counter'] += 1
+                    region_checks['camera'] += 1
+                    has_state_changed = True
             else:
                 logger.info(f"[MGS: Masala Garden Salad] Camera not found in: {read_values['current_region_name']}")
 
@@ -1443,24 +1663,14 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.rations_count_address, to_u16_bytes(self.save_state['rations_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'rations' in region_checks.keys():
-                if region_checks['rations'] < region_checks['rations_max']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'rations')
-                    if location_name is not None:
-                        if self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter'] or read_values['current_region_name'] == 'esc route':
-                            self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
-                            if self.save_state['rations_location_counter'] <= self.save_state['rations_max_location_counter']:
-                                self.save_state['rations_location_counter'] += 1
-                            region_checks['rations'] += 1
-                            has_state_changed = True
-                        else:
-                            logger.info(f"[MGS: Masala Garden Salad] Ration location counter exhausted ({self.save_state['rations_location_counter']} > {self.save_state['rations_max_location_counter']}) before sending {location_name} in {read_values['current_region_name']}!")
-                else:
-                    # Leaving the Medi Room restores Snake's confiscated
-                    # inventory and can briefly make the Ration count appear
-                    # higher than the AP-owned count. Reconcile it silently;
-                    # this was not another physical Ration pickup.
-                    if time.monotonic() >= self.suppress_post_capture_ration_messages_until:
-                        logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['rations']} of {region_checks['rations_max']} Rations in {read_values['current_region_name']}!")
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'rations')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['rations_location_counter'] += 1
+                    region_checks['rations'] += 1
+                    has_state_changed = True
+                elif time.monotonic() >= self.suppress_post_capture_ration_messages_until:
+                    logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['rations']} of {region_checks['rations_max']} Rations in {read_values['current_region_name']}!")
             else:
                 logger.info(f"[MGS: Masala Garden Salad] Rations not found in: {read_values['current_region_name']}")
         elif read_values['rations_held'] < self.save_state['rations_counter']:
@@ -1472,12 +1682,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.medicine_count_address, to_u16_bytes(self.save_state['medicine_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'medicine' in region_checks.keys():
-                if region_checks['medicine'] < region_checks['medicine_max'] and self.save_state['medicine_location_counter'] <= self.save_state['medicine_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'medicine')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['medicine_location_counter'] += 1
-                        region_checks['medicine'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'medicine')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['medicine_location_counter'] += 1
+                    region_checks['medicine'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['medicine']} of {region_checks['medicine_max']} Medicine in {read_values['current_region_name']}!")
             else:
@@ -1491,12 +1701,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.diazepam_count_address, to_u16_bytes(self.save_state['diazepam_counter']), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'diazepam' in region_checks.keys():
-                if region_checks['diazepam'] < region_checks['diazepam_max'] and self.save_state['diazepam_location_counter'] <= self.save_state['diazepam_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'diazepam')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['diazepam_location_counter'] += 1
-                        region_checks['diazepam'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'diazepam')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['diazepam_location_counter'] += 1
+                    region_checks['diazepam'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['diazepam']} of {region_checks['diazepam_max']} Diazepam in {read_values['current_region_name']}!")
             else:
@@ -1539,6 +1749,9 @@ class MetalGearSolidClient(BizHawkClient):
         #     self.save_state['pal_key_counter'] = read_values['pal_key_held']
         #     has_state_changed = True
 
+        if self.queue_meryl_key_card_from_pal_event():
+            has_state_changed = True
+
         # Key Card
         # NOTE: No regional check for pickups. Should be impossible to pickup key cards multiple times as they trigger during cutscenes
         # Several Key Card cutscenes were popping the wrong Key Card i.e. Gray Fox would pop Meryl's Key Card
@@ -1551,10 +1764,8 @@ class MetalGearSolidClient(BizHawkClient):
         key_card_event_time = time.monotonic()
         identified_level = KEY_CARD_LEVEL_BY_CUTSCENE_BYTES.get(read_values['current_cutscene_bytes'])
 
-        # Level 2 is paired directly with the Revolver Ocelot story check in
-        # the boss-cutscene handler below. Do not use the AP-owned Progressive
-        # Key Card level as authorization for this location; the randomized
-        # card may be anywhere in the multiworld.
+        # Baker's reward follows Ocelot's actual defeat, not a collected check.
+        ocelot_boss_seen = bool(self.save_state['boss_event_mask'] & (1 << BOSS_EVENT_BITS['BOSS: Revolver Ocelot']))
 
         if identified_level is not None:
             self.recent_key_card_cutscene_level = identified_level
@@ -1578,6 +1789,8 @@ class MetalGearSolidClient(BizHawkClient):
                     matching_cutscene_level = self.recent_key_card_cutscene_level
 
                 confirmed_level = matching_cutscene_level
+                if observed_level == 2 and ocelot_boss_seen:
+                    confirmed_level = 2
 
                 if confirmed_level == observed_level:
                     location_name = f'Key Card Level {confirmed_level}'
@@ -1620,6 +1833,13 @@ class MetalGearSolidClient(BizHawkClient):
             if read_values['current_cutscene_bytes'] == RAM.key_card_level_1_cutscene_bytes and self.save_state['key_card_counter'] >= 1:
                 if self.save_state['key_card_location_counter'] <= self.save_state['key_card_max_location_counter']:
                     location_name = 'Key Card Level 1'
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['key_card_location_counter'] += 1
+                    self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
+                    has_state_changed = True
+            elif read_values['current_cutscene_bytes'] == RAM.key_card_level_2_cutscene_bytes and self.save_state['key_card_counter'] >= 2:
+                if self.save_state['key_card_location_counter'] <= self.save_state['key_card_max_location_counter']:
+                    location_name = 'Key Card Level 2'
                     self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
                     self.save_state['key_card_location_counter'] += 1
                     self.save_state['viewed_key_card_cutscene_text'].append(read_values['current_cutscene_text'])
@@ -1781,12 +2001,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.socom_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'socom' in region_checks.keys():
-                if region_checks['socom'] < region_checks['socom_max'] and self.save_state['socom_location_counter'] <= self.save_state['socom_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'socom')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['socom_location_counter'] += 1
-                        region_checks['socom'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'socom')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['socom_location_counter'] += 1
+                    region_checks['socom'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['socom']} of {region_checks['socom_max']} SOCOM in {read_values['current_region_name']}!")
             else:
@@ -1806,12 +2026,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.famas_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'famas' in region_checks.keys():
-                if region_checks['famas'] < region_checks['famas_max'] and self.save_state['famas_location_counter'] <= self.save_state['famas_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'famas')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['famas_location_counter'] += 1
-                        region_checks['famas'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'famas')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['famas_location_counter'] += 1
+                    region_checks['famas'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['famas']} of {region_checks['famas_max']} FA-MAS in {read_values['current_region_name']}!")
             else:
@@ -1831,12 +2051,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.grenade_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'grenade' in region_checks.keys():
-                if region_checks['grenade'] < region_checks['grenade_max'] and self.save_state['grenade_location_counter'] <= self.save_state['grenade_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'grenade')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['grenade_location_counter'] += 1
-                        region_checks['grenade'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'grenade')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['grenade_location_counter'] += 1
+                    region_checks['grenade'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['grenade']} of {region_checks['grenade_max']} Grenade in {read_values['current_region_name']}!")
             else:
@@ -1854,12 +2074,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.nikita_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'nikita' in region_checks.keys():
-                if region_checks['nikita'] < region_checks['nikita_max'] and self.save_state['nikita_location_counter'] <= self.save_state['nikita_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'nikita')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['nikita_location_counter'] += 1
-                        region_checks['nikita'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'nikita')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['nikita_location_counter'] += 1
+                    region_checks['nikita'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['nikita']} of {region_checks['nikita_max']} Nikita in {read_values['current_region_name']}!")
             else:
@@ -1877,12 +2097,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.stinger_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'stinger' in region_checks.keys():
-                if region_checks['stinger'] < region_checks['stinger_max'] and self.save_state['stinger_location_counter'] <= self.save_state['stinger_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'stinger')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['stinger_location_counter'] += 1
-                        region_checks['stinger'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'stinger')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['stinger_location_counter'] += 1
+                    region_checks['stinger'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['stinger']} of {region_checks['stinger_max']} Stinger in {read_values['current_region_name']}!")
             else:
@@ -1900,12 +2120,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.claymore_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'claymore' in region_checks.keys():
-                if region_checks['claymore'] < region_checks['claymore_max'] and self.save_state['claymore_location_counter'] <= self.save_state['claymore_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'claymore')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['claymore_location_counter'] += 1
-                        region_checks['claymore'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'claymore')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['claymore_location_counter'] += 1
+                    region_checks['claymore'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['claymore']} of {region_checks['claymore_max']} Claymore in {read_values['current_region_name']}!")
             else:
@@ -1923,12 +2143,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.c4_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'c4' in region_checks.keys():
-                if region_checks['c4'] < region_checks['c4_max'] and self.save_state['c4_location_counter'] <= self.save_state['c4_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'c4')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['c4_location_counter'] += 1
-                        region_checks['c4'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'c4')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['c4_location_counter'] += 1
+                    region_checks['c4'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['c4']} of {region_checks['c4_max']} C4 in {read_values['current_region_name']}!")
             else:
@@ -1946,12 +2166,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'stun_grenade' in region_checks.keys():
-                if region_checks['stun_grenade'] < region_checks['stun_grenade_max'] and self.save_state['stun_grenade_location_counter'] <= self.save_state['stun_grenade_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'stun_grenade')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['stun_grenade_location_counter'] += 1
-                        region_checks['stun_grenade'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'stun_grenade')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['stun_grenade_location_counter'] += 1
+                    region_checks['stun_grenade'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['stun_grenade']} of {region_checks['stun_grenade_max']} Stun Grenade in {read_values['current_region_name']}!")
             else:
@@ -1969,12 +2189,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.chaff_g_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'chaff_grenade' in region_checks.keys():
-                if region_checks['chaff_grenade'] < region_checks['chaff_grenade_max'] and self.save_state['chaff_grenade_location_counter'] <= self.save_state['chaff_grenade_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'chaff_grenade')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['chaff_grenade_location_counter'] += 1
-                        region_checks['chaff_grenade'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'chaff_grenade')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['chaff_grenade_location_counter'] += 1
+                    region_checks['chaff_grenade'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['chaff_grenade']} of {region_checks['chaff_grenade_max']} Chaff Grenade in {read_values['current_region_name']}!")
             else:
@@ -1992,12 +2212,12 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.psg1_ammo_address, to_u16_bytes(write_value), 'MainRAM'))
             region_checks: dict = self.save_state['checks_per_region_tracker'][read_values['current_region_name']]
             if 'psg1' in region_checks.keys():
-                if region_checks['psg1'] < region_checks['psg1_max'] and self.save_state['psg1_location_counter'] <= self.save_state['psg1_max_location_counter']:
-                    location_name = self.get_next_region_location_name(read_values['current_region_name'], 'psg1')
-                    if location_name is not None and self.queue_location(location_name):
-                        self.save_state['psg1_location_counter'] += 1
-                        region_checks['psg1'] += 1
-                        has_state_changed = True
+                location_name = self.get_next_region_location_name(read_values['current_region_name'], 'psg1')
+                if location_name is not None:
+                    self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+                    self.save_state['psg1_location_counter'] += 1
+                    region_checks['psg1'] += 1
+                    has_state_changed = True
                 else:
                     logger.info(f"[MGS: Masala Garden Salad] Already picked up {region_checks['psg1']} of {region_checks['psg1_max']} PSG-1 in {read_values['current_region_name']}!")
             else:
@@ -2030,6 +2250,8 @@ class MetalGearSolidClient(BizHawkClient):
         ctx.command_processor.commands['check_goal'] = cmd_check_goal
         ctx.command_processor.commands['check_collection'] = cmd_check_collection
         ctx.command_processor.commands['kill_mantis'] = cmd_kill_mantis
+        ctx.command_processor.commands['pal'] = cmd_pal_key
+        ctx.command_processor.commands['pal_key'] = cmd_pal_key
 
 
         return True
@@ -2039,6 +2261,8 @@ class MetalGearSolidClient(BizHawkClient):
         # Don't run game_watcher if not connected to an archipelago server
         if ctx.server is None or ctx.server.socket.closed or ctx.slot_data is None or ctx.auth is None:
             return
+
+        await self.sync_boss_event_storage(ctx)
 
         # Goal completion is from receiving the locked Victory item. 
 		# It didn't seem to want to pop before, so let's "force it" the same way
@@ -2150,9 +2374,9 @@ class MetalGearSolidClient(BizHawkClient):
         read_values['current_cutscene_bytes'] = current_cutscene_bytes
         read_values['current_cutscene_text'] = current_cutscene_text
 
-        # During capture, owned inventory remains in RAM with its high bit set
-        # (for example, 0x001B becomes 0x801B). Detect that state directly so
-        # connecting midway through capture cannot restore Snake's equipment.
+        # During capture, owned inventory stays in RAM with the high bit set.
+        # Catch that directly so connecting in the middle of capture cannot give
+        # Snake all of his AP equipment back early.
         capture_inventory_keys = (
             'cbox_a_held', 'cbox_b_held', 'cbox_c_held',
             'night_vision_goggles_held', 'thermal_goggles_held',
@@ -2171,106 +2395,109 @@ class MetalGearSolidClient(BizHawkClient):
         )
 
         has_state_changed = False # Track if save_state has been updated. It needs to be saved to a json file if it has.
-        if capture_inventory_masked and not self.save_state['is_captured']:
+        capture_just_started = capture_inventory_masked and not self.save_state['is_captured']
+        if capture_just_started:
             self.save_state['is_captured'] = True
             has_state_changed = True
         write_list = [] # Track all the writes BizHawk should make to the game's RAM
-        # The first watcher pass restores the AP client's saved inventory into RAM.
-        # All reads in this pass were captured before that restore, so they must not
-        # be interpreted as new pickups, deaths, or location-triggering events.
+
+        # No AP-injected Time Bomb should survive into the capture sequence. The
+        # vanilla game plants its own Time Bomb when Snake gets his equipment back;
+        # leaving a trap/deathlink value (especially a stale 0) in this slot can make
+        # that scripted bomb fail to appear.
+        if capture_just_started:
+            write_list.append((RAM.time_bomb_count_address, to_u16_bytes(0xFFFF), 'MainRAM'))
+            write_list.append((RAM.time_bomb_death_count_address, to_u16_bytes(0xFFFF), 'MainRAM'))
+            self.active_ap_time_bomb_source = None
+            self.deathlink_death_pending = False
+        # Anything read on this first pass happened before the AP inventory restore,
+        # so don't treat it as a pickup/death/check.
         initial_sync = self.run_once
 
+        # Time Bomb Traps should not sit behind normal inventory processing. Scan
+        # the AP receive stream now so a safe trap can arm later in this same poll.
+        if self.queue_new_time_bomb_traps(ctx):
+            has_state_changed = True
+
+        # The Meryl sequence gives both the PAL Key check and Key Card Level 5.
+        # PAL's RAM change is the more reliable signal, so use it to reconcile Card 5
+        # even if the exact Meryl text was missed (including after reconnecting).
+        if not initial_sync and self.queue_meryl_key_card_from_pal_event():
+            has_state_changed = True
+
+        # Every scripted Key Card check gets a cutscene fallback. The old
+        # Gray Fox special-case was reliable because it did not depend on the RAM
+        # increase landing in the same watcher poll; use that behavior for all seven.
+        cutscene_key_card_level = KEY_CARD_LEVEL_BY_CUTSCENE_BYTES.get(current_cutscene_bytes)
+        if not initial_sync and cutscene_key_card_level is not None:
+            if self.queue_key_card_cutscene_location(cutscene_key_card_level, current_cutscene_text):
+                has_state_changed = True
+
         # === HANDLE CUTSCENE VIEW === #
-        # Certain cutscenes provide items and trigger Archipeligo location checks. This is where those are handled.
-        # Note: 'Game Completion' run goal is tracker here
-        if not initial_sync:
-            for cutscene_bytes in RAM.boss_cutscene_bytes_to_location_list.keys():
-                if current_cutscene_bytes == cutscene_bytes and current_cutscene_text not in self.save_state['viewed_boss_cutscene_bytes']:
-                    location_name = RAM.boss_cutscene_bytes_to_location_list[cutscene_bytes]
-                    # Normal item handling is disabled when locked up in the cell, but Otacon will provide the player with items. These need to be handled.
-                    if location_name == 'Otacon Gifts':
-                        self.save_state['handkerchief_location_counter'] += 1
-                        self.save_state['handkerchief_counter'] += 1
-                        self.locations_to_send += [self.location_name_to_server_location_id['Handkerchief']]
+        # Certain cutscenes provide items and trigger Archipelago location checks. This is where those are handled.
+        # Note: 'Game Completion' run goal is tracked here
+        for cutscene_bytes in RAM.boss_cutscene_bytes_to_location_list.keys():
+            if (not initial_sync
+                    and current_cutscene_bytes == cutscene_bytes
+                    and current_cutscene_text not in self.save_state['viewed_boss_cutscene_bytes']):
+                location_name = RAM.boss_cutscene_bytes_to_location_list[cutscene_bytes]
+                # Normal item handling is disabled when locked up in the cell, but Otacon will provide the player with items. These need to be handled.
+                if location_name == 'Otacon Gifts':
+                    self.save_state['handkerchief_location_counter'] += 1
+                    self.save_state['handkerchief_counter'] += 1
+                    self.locations_to_send += [self.location_name_to_server_location_id['Handkerchief']]
                     
-                        self.save_state['key_card_location_counter'] += 1
-                        self.locations_to_send += [self.location_name_to_server_location_id['Key Card Level 6']]
+                    self.queue_key_card_cutscene_location(6, current_cutscene_text)
 
-                        # Otacon's scripted Level 6 card is a location check, not a
-                        # progressive Key Card item. Keep the AP-owned key-card level
-                        # unchanged; if this location contains a Key Card, the normal
-                        # received-item path will increase it exactly once.
-                        key_card_write_value = self.save_state['key_card_counter']
-                        if 0x8000 <= read_values['key_card_held'] < 0xFFFF:
-                            key_card_write_value |= 0x8000
-                        write_list.append((
-                            RAM.key_card_count_address,
-                            to_u16_bytes(key_card_write_value),
-                            'MainRAM'
-                        ))
-                        write_list.append((
-                            RAM.key_card_death_count_address,
-                            to_u16_bytes(self.save_state['key_card_counter']),
-                            'MainRAM'
-                        ))
+                    # Otacon's scripted Level 6 card is a location check, not a
+                    # progressive Key Card item. Keep the AP-owned key-card level
+                    # unchanged; if this location contains a Key Card, the normal
+                    # received-item path will increase it exactly once.
+                    key_card_write_value = self.save_state['key_card_counter']
+                    if 0x8000 <= read_values['key_card_held'] < 0xFFFF:
+                        key_card_write_value |= 0x8000
+                    write_list.append((
+                        RAM.key_card_count_address,
+                        to_u16_bytes(key_card_write_value),
+                        'MainRAM'
+                    ))
+                    write_list.append((
+                        RAM.key_card_death_count_address,
+                        to_u16_bytes(self.save_state['key_card_counter']),
+                        'MainRAM'
+                    ))
 
-                        # Otacon gives Snake the Medi Room ration during this cutscene.
-                        # Use the region-aware location name instead of advancing the
-                        # legacy global Ration counter first (which incorrectly looked
-                        # for the next area's Ration 21 after the regional rename).
-                        ration_region = 'medi room'
-                        ration_location_name = self.get_next_region_location_name(ration_region, 'rations')
-                        self.save_state['rations_counter'] += 1
+                    # Otacon gives you the Medi Room ration here. Use the actual
+                    # regional check instead of advancing the global Ration number and
+                    # accidentally grabbing the first Comm Tower A ration.
+                    ration_region = 'medi room'
+                    ration_location_name = self.get_next_region_location_name(ration_region, 'rations')
+                    self.save_state['rations_counter'] += 1
 
-                        if ration_location_name is not None and self.queue_location(ration_location_name):
-                            self.save_state['rations_location_counter'] += 1
-                            ration_region_checks = self.save_state['checks_per_region_tracker'][ration_region]
-                            ration_region_checks['rations'] += 1
-                        elif ration_location_name is None:
-                            logger.info('[MGS: Masala Garden Salad] No unsent Medi Room ration location was found for Otacon Gifts.')
+                    if ration_location_name is not None and self.queue_location(ration_location_name):
+                        self.save_state['rations_location_counter'] += 1
+                        ration_region_checks = self.save_state['checks_per_region_tracker'][ration_region]
+                        ration_region_checks['rations'] += 1
+                    elif ration_location_name is None:
+                        logger.info('[MGS: Masala Garden Salad] No unsent Medi Room ration found for Otacon Gifts.')
 
-                        has_state_changed = True
-                    
-                    else:
-                        self.queue_location(location_name)
-                        if location_name == 'BOSS: Revolver Ocelot':
-                            # Baker's Level 2 Key Card location belongs to the same
-                            # story sequence. Queue it from the Ocelot cutscene itself
-                            # so randomizing Progressive Key Cards cannot suppress it.
-                            if self.queue_location('Key Card Level 2'):
-                                self.save_state['key_card_location_counter'] = max(
-                                    self.save_state['key_card_location_counter'],
-                                    3,
-                                )
-                                if current_cutscene_text not in self.save_state['viewed_key_card_cutscene_text']:
-                                    self.save_state['viewed_key_card_cutscene_text'].append(current_cutscene_text)
-                                logger.info(
-                                    '[MGS: Masala Garden Salad] Paired Revolver Ocelot with Key Card Level 2.'
-                                )
-                        elif location_name == 'BOSS: Gray Fox':
-                            if self.queue_location('Key Card Level 4'):
-                                self.save_state['key_card_location_counter'] = max(self.save_state['key_card_location_counter'], 5)
-                                if current_cutscene_text not in self.save_state['viewed_key_card_cutscene_text']:
-                                    self.save_state['viewed_key_card_cutscene_text'].append(current_cutscene_text)
-                        elif location_name == 'BOSS: Vulcan Raven':
-                            if self.queue_location('Key Card Level 7'):
-                                self.save_state['key_card_location_counter'] = max(self.save_state['key_card_location_counter'], 8)
-                                if current_cutscene_text not in self.save_state['viewed_key_card_cutscene_text']:
-                                    self.save_state['viewed_key_card_cutscene_text'].append(current_cutscene_text)
-                    assert isinstance(self.save_state['viewed_boss_cutscene_bytes'],list) # stops IDEs from complaining that save_state['viewed_boss_cutscene_bytes'] might not return a list.
-                    self.save_state['viewed_boss_cutscene_bytes'].append(current_cutscene_text)
                     has_state_changed = True
-                    if location_name == 'BOSS: Sniper Wolf I':
-                        self.save_state['is_captured'] = True
-                    elif location_name == 'BOSS: A Hind D?':
-                        self.save_state['has_defeated_hind'] = True
-                    elif location_name == 'BOSS: Metal Gear REX':
-                        self.save_state['endgame_inventory_locked'] = True
-                        self.save_state['endgame_rations_last_seen'] = read_values['rations_held']
-                        logger.info(
-                            '[MGS: Masala Garden Salad] Endgame inventory lock enabled. '
-                            'Server-granted gear will be withheld through the Liquid fight and Escape Route.'
-                        )
+                    
+                else:
+                    self.record_boss_event(location_name)
+                    self.queue_location(location_name)
+                assert isinstance(self.save_state['viewed_boss_cutscene_bytes'],list) # stops IDEs from complaining that save_state['viewed_boss_cutscene_bytes'] might not return a list.
+                self.save_state['viewed_boss_cutscene_bytes'].append(current_cutscene_text)
+                has_state_changed = True
+                if location_name == 'BOSS: Sniper Wolf I':
+                    self.save_state['is_captured'] = True
+                elif location_name == 'BOSS: A Hind D?':
+                    self.save_state['has_defeated_hind'] = True
+                elif location_name == 'BOSS: Metal Gear REX':
+                    # Once REX is down MGS strips Snake's inventory for the Liquid
+                    # fist fight. Keep AP out of the way until the game leaves the
+                    # Supply Route for the escape sequence.
+                    self.save_state['has_defeated_rex'] = True
 
         # === HANDLE READING CURRENT REGION === #
         # When the player pauses, a region name is displayed on screen. The location of this text in RAM moves, but is pointed to by 4 bytes at a known location
@@ -2297,8 +2524,7 @@ class MetalGearSolidClient(BizHawkClient):
         else:
             # HACK MGS: This is repeated code. It also appears at the end of the game_watcher function. It should be pulled out into it's own function. I'm just lazy right now!
             if len(self.locations_to_send) > 0:
-                await ctx.check_locations(self.locations_to_send)
-                self.locations_to_send.clear()
+                await self.flush_location_checks(ctx)
             if has_state_changed:
                 with open(self.save_file, 'w') as save:
                     json.dump(self.save_state, save)
@@ -2307,8 +2533,25 @@ class MetalGearSolidClient(BizHawkClient):
 
         # All regions in the game should appear in the regions list, unless I've yet to discover a secret area!
         if current_region_name not in self.save_state['regions']:
-            logger.debug(f'[Metal Gear Solid - DEBUG] Region: \"{current_region_name}\", not found in list of valid regions! high: {high_offset_bytestring}, low: {low_offset_bytestring}, Current Region Address: 0x{current_region_address:x}')
+            logger.debug(f'[MGS: Masala Garden Salad - DEBUG] Region: \"{current_region_name}\", not found in list of valid regions! high: {high_offset_bytestring}, low: {low_offset_bytestring}, Current Region Address: 0x{current_region_address:x}')
             return
+
+        # REX and the Liquid fist fight both report as Supply Route. After REX is
+        # defeated MGS intentionally strips Snake's equipment, so AP must not put
+        # anything back until the game moves on to the Escape Route.
+        liquid_inventory_lock = (
+            current_region_name == 'spply rte.'
+            and self.save_state.get('has_defeated_rex', False)
+        )
+
+        # MGS intentionally limits Snake's inventory during the Escape Route.
+        # Keep normal Archipelago inventory completely out of the way here too.
+        # Time Bomb Traps and DeathLink are handled separately below and are
+        # intentionally still allowed during the escape.
+        escape_route_inventory_lock = current_region_name == 'esc route'
+        normal_inventory_lock = liquid_inventory_lock or escape_route_inventory_lock
+        if not escape_route_inventory_lock:
+            self.escape_route_rations_last_seen = None
         
         # After escaping the torture room and regaining your items, the next area you'll have access to is 'cell'
         # If the player makes it to 'cell', they are no longer captured
@@ -2318,9 +2561,6 @@ class MetalGearSolidClient(BizHawkClient):
             and not capture_inventory_masked
         ):
             self.save_state['is_captured'] = False
-            # Inventory restoration and RAM writes can span several watcher
-            # polls. Suppress only the misleading duplicate Ration message
-            # during that short transition; normal pickup detection remains on.
             self.suppress_post_capture_ration_messages_until = time.monotonic() + 3.0
             has_state_changed = True
         # After defeating the Stealth Camouflaged Genome Soldiers, the player goes right into the Sniper Wolf II battle.
@@ -2328,7 +2568,8 @@ class MetalGearSolidClient(BizHawkClient):
         elif not initial_sync and current_region_name == 'snowfield' and not self.save_state['has_snowfield']:
             self.save_state['has_snowfield'] = True
             location_name = 'BOSS: Stealth Camouflaged Genome Soldiers'
-            self.locations_to_send += [self.location_name_to_server_location_id[location_name]]
+            self.record_boss_event(location_name)
+            self.queue_location(location_name)
             has_state_changed = True
 
         # === HANDLE KILL MANTIS COMMAND === #
@@ -2347,14 +2588,37 @@ class MetalGearSolidClient(BizHawkClient):
                 logger.info('[MGS: Masala Garden Salad] You must be in the Commander Room to use this command!')
             self.kill_mantis_command = False
 
+        # === HANDLE PAL KEY TEMPERATURE COMMAND === #
+        # This skips the hot/cold room backtracking, but it should never give the
+        # player a PAL Key they have not actually received from Archipelago.
+        if self.pal_key_temperature_command is not None:
+            pal_state = self.pal_key_temperature_command
+            self.pal_key_temperature_command = None
+
+            if self.save_state.get('pal_key_counter', 0) < 1:
+                logger.info('[MGS: Masala Garden Salad] You need the PAL Key before using this command!')
+            elif self.save_state.get('is_captured', False) or liquid_inventory_lock:
+                logger.info('[MGS: Masala Garden Salad] The PAL Key is not available right now!')
+            else:
+                pal_values = {
+                    'normal': (0x0000, 0x0000, 'Normal'),
+                    'hot': (0x0001, 0x2823, 'Hot'),
+                    'cold': (0x0002, 0xDCD8, 'Cold'),
+                }
+                form, temp, display_name = pal_values[pal_state]
+                write_list.append((RAM.pal_key_form_address, to_u16_bytes(form), 'MainRAM'))
+                write_list.append((RAM.pal_key_temp_address, to_u16_bytes(temp), 'MainRAM'))
+                logger.info(f'[MGS: Masala Garden Salad] PAL Key set to {display_name}.')
+                if ctx.slot:
+                    await ctx.send_msgs([{
+                        'cmd': 'Say',
+                        'text': f'I used a cheat to set the PAL Key to {display_name}!'
+                    }])
+
 
         # When loading up a save file, Write all values from Save State to RAM
         # Not doing this can cause the handle_item_pickups() function to assume the player has lost all their ammo
-        if (
-            self.run_once
-            and not self.save_state['is_captured']
-            and not self.save_state.get('endgame_inventory_locked', False)
-        ):
+        if self.run_once and not self.save_state['is_captured'] and not normal_inventory_lock:
             if self.save_state['has_cbox_a']:
                 write_list.append((RAM.cbox_a_count_address, to_u16_bytes(self.save_state['cbox_a_counter']), 'MainRAM'))
                 write_list.append((RAM.cbox_a_death_count_address, to_u16_bytes(self.save_state['cbox_a_counter']), 'MainRAM'))
@@ -2443,9 +2707,8 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.clear()
             self.run_once = False
         elif self.run_once:
-            # Capture blocked the initial inventory restore, but the first-pass
-            # synchronization guard must still expire so Otacon and later
-            # cutscene checks can be observed while Snake remains captured.
+            # Capture/final-fight inventory locks block the restore, but the
+            # one-time sync guard still needs to expire so later events are seen normally.
             self.run_once = False
 
         # === FOR DEBUG! === #
@@ -2497,19 +2760,117 @@ class MetalGearSolidClient(BizHawkClient):
             write_list.append((RAM.psg1_max_ammo_address, to_u16_bytes(self.max_items), 'MainRAM'))
 
         
-        if not initial_sync:
-            pickup_state_changed = self.handle_item_pickups(read_values, write_list)
+        # DeathLink and Time Bomb Traps share MGS's Time Bomb slot, but AP bombs
+        # are temporary. Never let one become part of Snake's saved inventory or
+        # interfere with the scripted bomb after capture. Do not use the subtitle
+        # text buffer as a cutscene flag; MGS can leave old text there during gameplay.
+        #
+        # The game's true empty sentinel is 0xFFFF. A trap death can leave 0 behind
+        # if the on-death copy was not cleared, which is why older builds could arm
+        # exactly one trap and then get stuck forever.
+        time_bomb_write_queued = False
+
+        # If an AP bomb was discarded/cleared normally, stop treating it as active.
+        # (Do not use a raw value of 0 here: zero is the final countdown value and
+        # clearing at that instant could overwrite the explosion with another trap.)
+        if self.active_ap_time_bomb_source is not None and read_values['time_bomb_held'] == 0xFFFF:
+            if self.active_ap_time_bomb_source == 'deathlink':
+                self.deathlink_death_pending = False
+            self.active_ap_time_bomb_source = None
+
+        if (
+            self.death_link_enabled
+            and self.pending_deathlink
+            and not initial_sync
+            and not self.save_state['is_captured']
+            and not liquid_inventory_lock
+            and not read_values['is_game_over']
+        ):
+            # DeathLink intentionally takes priority over a currently active AP trap.
+            # Keep the death-backup slot empty so Continue cannot resurrect the bomb.
+            write_list.append((RAM.time_bomb_count_address, to_u16_bytes(1), 'MainRAM'))
+            write_list.append((RAM.time_bomb_death_count_address, to_u16_bytes(0xFFFF), 'MainRAM'))
+            self.pending_deathlink = False
+            self.deathlink_death_pending = True
+            self.active_ap_time_bomb_source = 'deathlink'
+            time_bomb_write_queued = True
+            logger.info('[MGS: Masala Garden Salad] DeathLink received. Time Bomb armed with 1 second left.')
+            await self.display_message(ctx, 'DeathLink Time Bomb armed: 1 second!')
+
+        pending_time_bomb_traps = self.save_state.setdefault('pending_time_bomb_traps', [])
+        # MGS can leave the Time Bomb slot sitting at 0 after a bomb is gone.
+        # Treat both 0 and 0xFFFF as available; positive values mean a real
+        # Time Bomb is still counting down and should not be overwritten.
+        time_bomb_is_clear = read_values['time_bomb_held'] in (0, 0xFFFF)
+        story_time_bomb_region = current_region_name == 'medi room'
+        if (
+            pending_time_bomb_traps
+            and not self.pending_deathlink
+            and not self.deathlink_death_pending
+            and self.active_ap_time_bomb_source is None
+            and not time_bomb_write_queued
+            and not initial_sync
+            and not self.save_state['is_captured']
+            and not liquid_inventory_lock
+            and not read_values['is_game_over']
+            and not story_time_bomb_region
+            and time_bomb_is_clear
+        ):
+            trap_timer = pending_time_bomb_traps.pop(0)
+            write_list.append((RAM.time_bomb_count_address, to_u16_bytes(trap_timer), 'MainRAM'))
+            # A trap should never be restored by Continue. Explicitly keep MGS's
+            # on-death Time Bomb slot empty so the live slot returns to 0xFFFF.
+            write_list.append((RAM.time_bomb_death_count_address, to_u16_bytes(0xFFFF), 'MainRAM'))
+            self.active_ap_time_bomb_source = 'trap'
+            has_state_changed = True
+            logger.info('[MGS: Masala Garden Salad] Received Time Bomb Trap!')
+            await self.display_message(ctx, 'Received Time Bomb Trap!')
+
+        if not initial_sync and not liquid_inventory_lock:
+            if escape_route_inventory_lock:
+                pickup_state_changed = self.handle_escape_route_pickups(read_values, write_list)
+            else:
+                pickup_state_changed = self.handle_item_pickups(read_values, write_list)
             has_state_changed = has_state_changed or pickup_state_changed
 
         # == HANDLE DEATH == #
         # When entering a new area, the player's stats are copied to another part of RAM
         # Upon death, those values are used to reset the player's stats
         # I use the same technique! Upon death, reset the Client's counts to the values the game saved into the 'on_death' part of RAM
+        is_game_over = bool(read_values['is_game_over'])
+        new_game_over = is_game_over and not self.was_game_over
+
+        if not initial_sync and new_game_over:
+            ap_bomb_source = self.active_ap_time_bomb_source
+            if ap_bomb_source is not None:
+                # Fully remove an injected bomb after the death it caused. In
+                # particular, don't leave a 0 in the Time Bomb slot: MGS uses
+                # 0xFFFF for truly absent, and the post-capture story bomb expects
+                # that normal empty state.
+                write_list.append((RAM.time_bomb_count_address, to_u16_bytes(0xFFFF), 'MainRAM'))
+                write_list.append((RAM.time_bomb_death_count_address, to_u16_bytes(0xFFFF), 'MainRAM'))
+                self.active_ap_time_bomb_source = None
+                logger.info(f'[MGS: Masala Garden Salad] Cleared {ap_bomb_source} Time Bomb state after Game Over.')
+
+            if self.death_link_enabled:
+                if self.deathlink_death_pending:
+                    # This death came from somebody else's DeathLink. Don't bounce it back.
+                    self.deathlink_death_pending = False
+                else:
+                    # A Time Bomb Trap is a normal local death and should propagate
+                    # through DeathLink when the option is enabled.
+                    player_name = ctx.player_names.get(ctx.slot, 'Snake')
+                    await self.send_death_link(ctx, f'{player_name} died on Shadow Moses Island.')
+
+        # Set the edge detector even during the initial sync. Connecting while already
+        # sitting on Game Over should never send a fresh DeathLink.
+        self.was_game_over = is_game_over
+
         if (
             not initial_sync
-            and read_values['is_game_over']
+            and is_game_over
             and not self.save_state['is_captured']
-            and not self.save_state.get('endgame_inventory_locked', False)
+            and not normal_inventory_lock
         ):
             # A count of 0xFFFF means item is disabled. The save_state should not be updated
             if read_values['cbox_a_on_death'] != 0xFFFF:
@@ -2580,55 +2941,42 @@ class MetalGearSolidClient(BizHawkClient):
                 has_state_changed = True
                 self.save_state['suppressor_counter'] = read_values['suppressor_on_death']
                 write_list.append((RAM.suppressor_count_address, to_u16_bytes(read_values['suppressor_on_death']), 'MainRAM'))
-            if self.save_state['has_socom']:
-                has_state_changed = True
-                self.save_state['socom_counter'] = read_values['socom_ammo_on_death']
-                write_list.append((RAM.socom_ammo_address, to_u16_bytes(read_values['socom_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_famas']:
-                has_state_changed = True
-                self.save_state['famas_counter'] = read_values['famas_ammo_on_death']
-                write_list.append((RAM.famas_ammo_address, to_u16_bytes(read_values['famas_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_grenade']:
-                has_state_changed = True
-                self.save_state['grenade_counter'] = read_values['grenade_ammo_on_death']
-                write_list.append((RAM.grenade_ammo_address, to_u16_bytes(read_values['grenade_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_nikita']:
-                has_state_changed = True
-                self.save_state['nikita_counter'] = read_values['nikita_ammo_on_death']
-                write_list.append((RAM.nikita_ammo_address, to_u16_bytes(read_values['nikita_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_stinger']:
-                has_state_changed = True
-                self.save_state['stinger_counter'] = read_values['stinger_ammo_on_death']
-                write_list.append((RAM.stinger_ammo_address, to_u16_bytes(read_values['stinger_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_claymore']:
-                has_state_changed = True
-                self.save_state['claymore_counter'] = read_values['claymore_ammo_on_death']
-                write_list.append((RAM.claymore_ammo_address, to_u16_bytes(read_values['claymore_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_c4']:
-                has_state_changed = True
-                self.save_state['c4_counter'] = read_values['c4_ammo_on_death']
-                write_list.append((RAM.c4_ammo_address, to_u16_bytes(read_values['c4_ammo_on_death']), 'MainRAM'))
-            if self.save_state['has_stun_grenade']:
-                has_state_changed = True
-                self.save_state['stun_grenade_counter'] = read_values['stun_grenade_on_death']
-                write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(read_values['stun_grenade_on_death']), 'MainRAM'))
-            if self.save_state['has_chaff_grenade']:
-                has_state_changed = True
-                self.save_state['chaff_grenade_counter'] = read_values['chaff_grenade_on_death']
-                write_list.append((RAM.chaff_g_death_ammo_address, to_u16_bytes(read_values['chaff_grenade_on_death']), 'MainRAM'))
-            if self.save_state['has_psg1']:
-                has_state_changed = True
-                self.save_state['psg1_counter'] = read_values['psg1_ammo_on_death']
-                write_list.append((RAM.psg1_ammo_address, to_u16_bytes(read_values['psg1_ammo_on_death']), 'MainRAM'))
+            weapon_death_restores = (
+                ('SOCOM', 'has_socom', 'socom_counter', 'socom_ammo_on_death', RAM.socom_ammo_address, RAM.socom_death_ammo_address),
+                ('FA-MAS', 'has_famas', 'famas_counter', 'famas_ammo_on_death', RAM.famas_ammo_address, RAM.famas_death_ammo_address),
+                ('Grenade', 'has_grenade', 'grenade_counter', 'grenade_ammo_on_death', RAM.grenade_ammo_address, RAM.grenade_death_ammo_address),
+                ('Nikita', 'has_nikita', 'nikita_counter', 'nikita_ammo_on_death', RAM.nikita_ammo_address, RAM.nikita_death_ammo_address),
+                ('Stinger', 'has_stinger', 'stinger_counter', 'stinger_ammo_on_death', RAM.stinger_ammo_address, RAM.stinger_death_ammo_address),
+                ('Claymore', 'has_claymore', 'claymore_counter', 'claymore_ammo_on_death', RAM.claymore_ammo_address, RAM.claymore_death_ammo_address),
+                ('C4', 'has_c4', 'c4_counter', 'c4_ammo_on_death', RAM.c4_ammo_address, RAM.c4_death_ammo_address),
+                ('Stun Grenade', 'has_stun_grenade', 'stun_grenade_counter', 'stun_grenade_on_death', RAM.stun_g_ammo_address, RAM.stun_g_death_ammo_address),
+                ('Chaff Grenade', 'has_chaff_grenade', 'chaff_grenade_counter', 'chaff_grenade_on_death', RAM.chaff_g_ammo_address, RAM.chaff_g_death_ammo_address),
+                ('PSG-1', 'has_psg1', 'psg1_counter', 'psg1_ammo_on_death', RAM.psg1_ammo_address, RAM.psg1_death_ammo_address),
+            )
+            for weapon_name, has_key, counter_key, death_key, live_address, death_address in weapon_death_restores:
+                if self.restore_weapon_ammo_from_death(
+                    weapon_name, has_key, counter_key, read_values[death_key],
+                    live_address, death_address, write_list
+                ):
+                    has_state_changed = True
+
+        # Keep PopTracker boss events in sync even after reconnecting to an existing slot.
+        await self.sync_boss_event_storage(ctx)
 
         # === SEND LOCATION CHECKS === #
         if len(self.locations_to_send) > 0:
-            await ctx.check_locations(self.locations_to_send)
-            self.locations_to_send.clear()
+            # Pickup detection usually queues a RAM rollback (remove the vanilla
+            # pickup) and a LocationChecks packet together. Apply the RAM write
+            # first so the same physical pickup cannot linger for another watcher
+            # poll while the server packet is in flight.
+            if len(write_list) > 0:
+                await bizhawk.write(ctx.bizhawk_ctx, write_list)
+                write_list.clear()
+            await self.flush_location_checks(ctx)
 
         if (
             not self.save_state['is_captured']
-            and not self.save_state.get('endgame_inventory_locked', False)
+            and not normal_inventory_lock
             and self.release_pending_missable_items(write_list)
         ):
             has_state_changed = True
@@ -2641,6 +2989,7 @@ class MetalGearSolidClient(BizHawkClient):
         # TODO MGS: Add the option to vary the item counts received?
         if (
             not self.save_state['is_captured']
+            and not normal_inventory_lock
             and self.save_state['received_item_counter'] < len(ctx.items_received)
         ):
             has_state_changed = True
@@ -2650,20 +2999,12 @@ class MetalGearSolidClient(BizHawkClient):
                 local_item_name = ctx.item_names.lookup_in_game(code=item.item, game_name='MGS: Masala Garden Salad')
                 self.save_state['received_item_counter'] += 1
 
-                # Liquid removes Snake's inventory after REX. Keep processing
-                # goal-only items so Boss Blitz/Dogtag goals and Victory still
-                # work, but do not write any inventory-bearing AP item back into
-                # the game during the final fight and Escape Route.
-                if (
-                    self.save_state.get('endgame_inventory_locked', False)
-                    and local_item_name not in {'Dogtag', 'Boss Dogtag', 'Victory'}
-                ):
-                    self.save_state.setdefault('pending_endgame_items', []).append(local_item_name)
-                    logger.info(
-                        f'[MGS: Masala Garden Salad] Endgame inventory lock: '
-                        f'{local_item_name} was received but not granted in-game.'
-                    )
-                    continue
+                sender_name = ctx.player_names.get(item.player, f'Player {item.player}')
+                if local_item_name != 'Time Bomb Trap':
+                    if item.player == ctx.slot:
+                        await self.display_message(ctx, f'Found {local_item_name}')
+                    else:
+                        await self.display_message(ctx, f'Received {local_item_name} from {sender_name}')
 
                 if self.hold_missable_item(local_item_name):
                     self.save_state.setdefault('pending_missable_items', []).append(local_item_name)
@@ -2703,54 +3044,59 @@ class MetalGearSolidClient(BizHawkClient):
                         self.give_missable_item(local_item_name, write_list)
                     case 'SOCOM':
                         self.save_state['has_socom'] = True
-                        self.save_state['socom_counter'] = min(0xFFFF, self.save_state['socom_counter'] + 24)
+                        self.save_state['socom_counter'] = min(AP_AMMO_CAP, self.save_state['socom_counter'] + 24)
                         write_list.append((RAM.socom_ammo_address, to_u16_bytes(self.save_state['socom_counter']), 'MainRAM'))
                         write_list.append((RAM.socom_death_ammo_address, to_u16_bytes(self.save_state['socom_counter']), 'MainRAM'))
                     case 'FA-MAS':
                         self.save_state['has_famas'] = True
-                        self.save_state['famas_counter'] = min(0xFFFF, self.save_state['famas_counter'] + 35)
+                        self.save_state['famas_counter'] = min(AP_AMMO_CAP, self.save_state['famas_counter'] + 35)
                         write_list.append((RAM.famas_ammo_address, to_u16_bytes(self.save_state['famas_counter']), 'MainRAM'))
                         write_list.append((RAM.famas_death_ammo_address, to_u16_bytes(self.save_state['famas_counter']), 'MainRAM'))
                     case 'Grenade':
                         self.save_state['has_grenade'] = True
-                        self.save_state['grenade_counter'] = min(0xFFFF, self.save_state['grenade_counter'] + 3)
+                        self.save_state['grenade_counter'] = min(AP_AMMO_CAP, self.save_state['grenade_counter'] + 3)
                         write_list.append((RAM.grenade_ammo_address, to_u16_bytes(self.save_state['grenade_counter']), 'MainRAM'))
                         write_list.append((RAM.grenade_death_ammo_address, to_u16_bytes(self.save_state['grenade_counter']), 'MainRAM'))
                     case 'Nikita':
                         self.save_state['has_nikita'] = True
-                        self.save_state['nikita_counter'] = min(0xFFFF, self.save_state['nikita_counter'] + 10)
+                        self.save_state['nikita_counter'] = min(AP_AMMO_CAP, self.save_state['nikita_counter'] + 10)
                         write_list.append((RAM.nikita_ammo_address, to_u16_bytes(self.save_state['nikita_counter']), 'MainRAM'))
                         write_list.append((RAM.nikita_death_ammo_address, to_u16_bytes(self.save_state['nikita_counter']), 'MainRAM'))
                     case 'Stinger':
                         self.save_state['has_stinger'] = True
-                        self.save_state['stinger_counter'] = min(0xFFFF, self.save_state['stinger_counter'] + 10)
+                        self.save_state['stinger_counter'] = min(AP_AMMO_CAP, self.save_state['stinger_counter'] + 10)
                         write_list.append((RAM.stinger_ammo_address, to_u16_bytes(self.save_state['stinger_counter']), 'MainRAM'))
                         write_list.append((RAM.stinger_death_ammo_address, to_u16_bytes(self.save_state['stinger_counter']), 'MainRAM'))
                     case 'Claymore':
                         self.save_state['has_claymore'] = True
-                        self.save_state['claymore_counter'] = min(0xFFFF, self.save_state['claymore_counter'] + 10)
+                        self.save_state['claymore_counter'] = min(AP_AMMO_CAP, self.save_state['claymore_counter'] + 10)
                         write_list.append((RAM.claymore_ammo_address, to_u16_bytes(self.save_state['claymore_counter']), 'MainRAM'))
                         write_list.append((RAM.claymore_death_ammo_address, to_u16_bytes(self.save_state['claymore_counter']), 'MainRAM'))
                     case 'C4':
                         self.save_state['has_c4'] = True
-                        self.save_state['c4_counter'] = min(0xFFFF, self.save_state['c4_counter'] + 10)
+                        self.save_state['c4_counter'] = min(AP_AMMO_CAP, self.save_state['c4_counter'] + 10)
                         write_list.append((RAM.c4_ammo_address, to_u16_bytes(self.save_state['c4_counter']), 'MainRAM'))
                         write_list.append((RAM.c4_death_ammo_address, to_u16_bytes(self.save_state['c4_counter']), 'MainRAM'))
                     case 'Stun Grenade':
                         self.save_state['has_stun_grenade'] = True
-                        self.save_state['stun_grenade_counter'] = min(0xFFFF, self.save_state['stun_grenade_counter'] + 3)
+                        self.save_state['stun_grenade_counter'] = min(AP_AMMO_CAP, self.save_state['stun_grenade_counter'] + 3)
                         write_list.append((RAM.stun_g_ammo_address, to_u16_bytes(self.save_state['stun_grenade_counter']), 'MainRAM'))
                         write_list.append((RAM.stun_g_death_ammo_address, to_u16_bytes(self.save_state['stun_grenade_counter']), 'MainRAM'))
                     case 'Chaff Grenade':
                         self.save_state['has_chaff_grenade'] = True
-                        self.save_state['chaff_grenade_counter'] = min(0xFFFF, self.save_state['chaff_grenade_counter'] + 5)
+                        self.save_state['chaff_grenade_counter'] = min(AP_AMMO_CAP, self.save_state['chaff_grenade_counter'] + 5)
                         write_list.append((RAM.chaff_g_ammo_address, to_u16_bytes(self.save_state['chaff_grenade_counter']), 'MainRAM'))
                         write_list.append((RAM.chaff_g_death_ammo_address, to_u16_bytes(self.save_state['chaff_grenade_counter']), 'MainRAM'))
                     case 'PSG-1':
                         self.save_state['has_psg1'] = True
-                        self.save_state['psg1_counter'] = min(0xFFFF, self.save_state['psg1_counter'] + 12)
+                        self.save_state['psg1_counter'] = min(AP_AMMO_CAP, self.save_state['psg1_counter'] + 12)
                         write_list.append((RAM.psg1_ammo_address, to_u16_bytes(self.save_state['psg1_counter']), 'MainRAM'))
                         write_list.append((RAM.psg1_death_ammo_address, to_u16_bytes(self.save_state['psg1_counter']), 'MainRAM'))
+                    case 'Time Bomb Trap':
+                        # Already queued by queue_new_time_bomb_traps() before the
+                        # trap-arm check. The normal receive cursor still advances
+                        # here so the rest of the AP item stream stays in order.
+                        pass
                     case 'Dogtag':
                         self.save_state['dogtag_counter'] += 1
                         if self.save_state['dogtag_counter'] == self.dogtag_goal and self.run_goal == 2: # option 2 is dogtag collection
@@ -2776,7 +3122,7 @@ class MetalGearSolidClient(BizHawkClient):
                             }])
                             ctx.finished_game = True
                     case _:
-                        logger.debug(f'[Metal Gear Solid - DEBUG] No item handler for item named \'{local_item_name}\'')
+                        logger.debug(f'[MGS: Masala Garden Salad - DEBUG] No item handler for item named \'{local_item_name}\'')
 
         # === WRITE TO RAM === #
         if len(write_list) > 0:
