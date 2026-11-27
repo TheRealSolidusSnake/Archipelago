@@ -50,10 +50,17 @@ If you don't do this step prior to starting your game, you will have to save you
 
 The original dev added a command that can be entered into the Archipelago BizHawk Client that will set his health to 0, effectively allowing players to skip this boss fight (The player will still need to hit Mantis at least once while he is at 0 HP to trigger the ending cutscene). You can also land every 8th bullet on him with Port 1, and if you get a Game Over three times and call the Colonel on your codec; he will tell you to shoot the two draped statues on the sides of the room to break Mantis's concentration which will also allow you to hit him.
 
-
 ## How do I contact Meryl?
 
-Her frequency is located on the back of the CD case.
+Her frequency is located on the back of the CD case. 
+
+## How do I increase the length of time the send/receive messages are on screen?
+
+Config > Messages inside of BizHawk
+
+<img width="511" height="474" alt="image" src="https://github.com/user-attachments/assets/9c56dfcb-e65a-4f6d-939e-45f65c52b87e" />
+
+`Messages will fade after "3" Seconds` but you're free to change the 3 to whatever time you'd like
 
 ## Unique Local Commands
 
@@ -61,3 +68,6 @@ The following commands are only available when using the BizHawk Client to play 
 - `/check_goal` Prints the progress towards the world's selected goal.
 - `/check_collection <region>` Prints which items have been collected in the provided region. By default, the region the player is currently in will be used. 'all' can also be used to print every region.
 - `/kill_mantis` A cheat that reduces Psycho Mantis' HP to 0 in case the player has difficulty switching controller ports in the BizHawk emulator. (Do not use this while HIDEO is on your screen)
+- `/pal hot` A cheat that makes the PAL Key "Hot" so you don't have to backtrack (can be used as `/pal_key hot` as well)
+- `/pal cold` A cheat that makes the PAL Key "Cold" so you don't have to backtrack (can be used as `/pal_key cold` as well)
+- `/pal normal` A cheat that makes the PAL Key "Normal" in case you accidentally heated or froze the key prior to using it. (can be used as `/pal_key normal` as well)
